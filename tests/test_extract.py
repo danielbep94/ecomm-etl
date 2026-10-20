@@ -140,3 +140,33 @@ def test_cleanup_keeps_partial_metrics_on_permission_failure():
     # Deletion is not counted as verified if its follow-up inspection fails.
     assert result["remaining"] is None
     assert len(result["failed_files"]) == 4
+
+
+def test_names_from_databricks_incoming_screenshot():
+    names = [
+        "2004_TBL_BI_BQ_CAT_ECOMM_PRODUCTS_EDP.csv",
+        "2006_TBL_BI_BQ_CAT_ECOMM_PRODUCTS_PET_BEC.csv",
+        "TBL_BI_BQ_CAT_ECOMM_POS.csv",
+        "TBL_BI_BQ_FACTS_ECOMM_ONE_DANONE_FULL_2026.csv",
+    ]
+    files = [{"ORIGINAL_FILE_NAME": name} for name in names]
+    assert E.validate_file_batch(files, 2026) == []
+    assert {f["LOGICAL_DATASET"] for f in files} == set(C.SOURCE_DEFINITIONS)
+    assert all(f["DISCOVERY_STATUS"] == "PASS" for f in files)
+
+
+@pytest.mark.parametrize(
+    "name", ["2004_TBL_BI_BQ_CAT_ECOMM_PRODUCTS_EDP.csv", "edp_2004_TBL_BI_BQ_CAT_ECOMM_PRODUCTS_EDP.CSV"]
+)
+def test_edp_name_aliases_preserve_physical_name(name):
+    files = manifest()
+    files[1]["ORIGINAL_FILE_NAME"] = name
+    assert E.validate_file_batch(files, 2025) == []
+    assert files[1]["LOGICAL_DATASET"] == "EDP_CATALOG"
+    assert files[1]["ORIGINAL_FILE_NAME"] == name
+
+
+def test_both_edp_aliases_in_one_batch_are_rejected():
+    files = manifest() + [{"ORIGINAL_FILE_NAME": "edp_2004_TBL_BI_BQ_CAT_ECOMM_PRODUCTS_EDP.csv"}]
+    issues = E.validate_file_batch(files, 2025)
+    assert any(rule == "DATASET_CARDINALITY" and count == 2 for _, rule, count, _ in issues)

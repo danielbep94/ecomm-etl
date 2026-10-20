@@ -13,8 +13,8 @@ FACT_FILE_TEMPLATE = "TBL_BI_BQ_FACTS_ECOMM_ONE_DANONE_FULL_{ANIO}.csv"
 FACT_FILE_PATTERN = r"^TBL_BI_BQ_FACTS_ECOMM_ONE_DANONE_FULL_(\d{4})\.csv$"
 EXPECTED_STATIC_FILES = {
     "EDP_CATALOG": {
-        "expected_file_name": "edp_2004_TBL_BI_BQ_CAT_ECOMM_PRODUCTS_EDP.csv",
-        "pattern": r"^edp_2004_TBL_BI_BQ_CAT_ECOMM_PRODUCTS_EDP\.csv$",
+        "expected_file_name": "2004_TBL_BI_BQ_CAT_ECOMM_PRODUCTS_EDP.csv",
+        "pattern": r"^(?:edp_)?2004_TBL_BI_BQ_CAT_ECOMM_PRODUCTS_EDP\.csv$",
         "catalog_bu": "EDP",
         "required": True,
     },

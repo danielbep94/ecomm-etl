@@ -109,6 +109,13 @@ schemas ni recursos adicionales.
 No se han ejecutado llamadas a tus servicios remotos desde este repositorio.
 Las pruebas locales no certifican permisos, conectores ni datos de producción.
 
+## Definición de tablas Snowflake
+
+Consulta [SNOWFLAKE_TABLES.md](SNOWFLAKE_TABLES.md) para ver el DDL exacto de
+la fact enriquecida, la estructura esperada del tracker existente y las consultas
+para comprobar el periodo cargado. Los catálogos y los hallazgos detallados se
+conservan en Delta, no en tablas Snowflake independientes.
+
 ## Configuración y credenciales
 
 `conf/settings.py` centraliza los nombres y las severidades. Los valores del
@@ -145,14 +152,15 @@ Deposita únicamente el lote completo en `incoming`:
 
 ```text
 TBL_BI_BQ_FACTS_ECOMM_ONE_DANONE_FULL_2025.csv
-edp_2004_TBL_BI_BQ_CAT_ECOMM_PRODUCTS_EDP.csv
+2004_TBL_BI_BQ_CAT_ECOMM_PRODUCTS_EDP.csv
 2006_TBL_BI_BQ_CAT_ECOMM_PRODUCTS_PET_BEC.csv
 TBL_BI_BQ_CAT_ECOMM_POS.csv
 ```
 
 La comparación de nombres y extensiones no distingue mayúsculas; los nombres
-físicos originales se conservan. `2004` y `2006` son parte del nombre, no del
-periodo de proceso. Se ignoran directorios y archivos de sistema/temporales.
+físicos originales se conservan. Para EDP también se admite el nombre anterior
+`edp_2004_TBL_BI_BQ_CAT_ECOMM_PRODUCTS_EDP.csv`; envía solo una de las dos variantes.
+`2004` y `2006` son parte del nombre, no del periodo de proceso. Se ignoran directorios y archivos de sistema/temporales.
 Cualquier archivo de negocio adicional o inesperado invalida el lote. No se
 asignan datasets por posición.
 
@@ -176,6 +184,24 @@ Se distinguen faltantes de valores numéricos mal formados; se rechazan fraccion
 en IDs, desbordamientos de Long, NaN e infinito. Los IDs son no negativos y el
 factor debe ser positivo. Los valores obligatorios vacíos, `NULL`, `NONE`, `N/A`
 y `NA` fallan. BU se normaliza con el mapa del requerimiento.
+
+## Usar el lote anual 2026 mostrado en Databricks
+
+Sincroniza `main` antes de ejecutar. Se admite
+`2004_TBL_BI_BQ_CAT_ECOMM_PRODUCTS_EDP.csv` sin prefijo `edp_`, conservando ese nombre.
+Con los cuatro CSV en `dbfs:/FileStore/tables/ecomm_dph/incoming`, abre
+`notebooks/job_ecommerce_danone.py` y configura ANIO=2026, MES=un mes que exista
+en el archivo anual, FORCE_REPROCESS=false. Por ejemplo, MES=7 procesa julio
+solo si hay registros de julio. El job no carga todos los meses a la vez.
+
+Antes de empezar conserva tus originales: en un fallo se elimina el lote enviado
+de `incoming`; en éxito se mueve a `current`. Para procesar otro mes o reintentar,
+vuelve a depositar los cuatro CSV. FORCE_REPROCESS=true se utiliza para sustituir
+un periodo que ya terminó correctamente.
+
+Después abre `notebooks/qa_ecommerce_danone.py` con el mismo ANIO/MES y
+FAIL_ON_QA_ERROR=true, dejando inicialmente vacíos los filtros opcionales. Consulta
+[SNOWFLAKE_TABLES.md](SNOWFLAKE_TABLES.md) para el DDL y las consultas de comprobación.
 
 ## Ejecución interactiva
 
@@ -406,3 +432,8 @@ en Python 3.12, Spark 4.0.4 y Delta Lake 4.0.1. Incluye un lote completo de cuat
 CSV con cargas Delta y movimientos locales de archivos reales. Ruff y la
 construcción del wheel también se verificaron. Snowflake se ejercitó con dobles
 de conexión; la ejecución integral en tu Databricks/Snowflake está pendiente.
+
+
+La compatibilidad con los nombres del lote 2026 de la captura se verificó con
+14 pruebas de extracción aprobadas, incluidas las dos variantes EDP y el rechazo
+de variantes duplicadas en el mismo lote.
