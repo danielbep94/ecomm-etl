@@ -17,9 +17,11 @@ originales. El código de producción está en los ocho módulos solicitados.
   enteras exactas como `1`, `1.0` y `1e3`, sin redondear identificadores.
 - `TIME_ID` usa **un solo formato por archivo**: `YYYYMM` o `YYYYMMDD`. Se
   comprueban las fechas reales y todos los años del archivo anual.
-- No se suministró el código del tracker anterior mencionado en los requisitos.
-  `src/run_tracking.py` implementa la API especificada, sus columnas y su contrato
-  append-only; no se afirma que sea idéntico a una implementación no adjunta.
+- `src/run_tracking.py` usa el tracker reutilizable adjunto por el usuario,
+  conservando sus funciones, firmas, normalización de conteos, duración Double
+  y `CREATED_AT_UTC`. Se mantienen los controles de integración: redacción de
+  secretos, estados terminales y verificación de la tabla existente antes del
+  append. No existe un segundo módulo `def_tracking.py`.
 - Un único productor deposita el lote y no modifica `incoming` mientras corre el
   job. Configura **`max_concurrent_runs = 1` para todo el pipeline**, no por mes.
   Ningún otro job debe escribir estos destinos simultáneamente. Las huellas y la
@@ -49,20 +51,26 @@ ecomm-etl/                         # raíz del proyecto ecommerce_danone
 │   ├── load.py
 │   ├── run_tracking.py
 │   └── main.py
+├── notebooks/
+│   ├── job_ecommerce_danone.py
+│   └── qa_ecommerce_danone.py
 ├── tests/                         # opcional, no requerido por el ETL
 │   ├── conftest.py
 │   ├── test_extract.py
 │   ├── test_transform.py
 │   ├── test_load.py
 │   ├── test_run_tracking.py
-│   └── test_main.py
+│   ├── test_main.py
+│   └── test_notebooks.py
 ├── .gitignore
 ├── pyproject.toml
 └── README.md
 ```
 
 `conf`, `logs` y `src` son paquetes namespace de Python; no se requieren archivos
-`__init__.py`. No se usan carpetas de notebooks, schemas ni recursos adicionales.
+`__init__.py`. Los notebooks son puntos de entrada a las funciones existentes;
+la lógica ETL y QA permanece en `src/`. No se añaden frameworks de configuración,
+schemas ni recursos adicionales.
 
 ## Requisitos en Databricks
 
@@ -127,7 +135,9 @@ contengan su contenido.
 La tabla `PIPELINE_RUNS` debe existir con la estructura suministrada. El código
 la consulta y solo hace append de una fila terminal por intento; no ejecuta DDL,
 MERGE, UPDATE ni DELETE sobre ella. No hay reintentos automáticos del append,
-pues una respuesta de red fallida puede tener un commit ambiguo.
+pues una respuesta de red fallida puede tener un commit ambiguo. El tracker
+adjunto incluye explícitamente `CREATED_AT_UTC=COMPLETED_AT_UTC` y escribe con
+correspondencia de columnas por nombre.
 
 ## Entrada: exactamente cuatro archivos
 
@@ -197,24 +207,68 @@ Completa los valores antes de volver a ejecutarla. Los parámetros ya proporcion
 por el job se conservan. Solo `true` / `false` se convierten a Boolean, evitando
 que el texto `"false"` se interprete como verdadero.
 
+## Notebooks de Databricks
+
+Los archivos `.py` de `notebooks/` tienen el encabezado de notebook source de
+Databricks y se abren como notebooks al sincronizar la Git folder. Detectan la
+raíz del clon para importar `src.main`; no duplican la lógica ni exponen opciones
+Snowflake o secretos. Configura las librerías del proyecto en el cómputo antes
+de ejecutarlos, como se indica arriba.
+
+### Notebook del job
+
+Abre `notebooks/job_ecommerce_danone.py`. Completa los widgets antes de ejecutar
+todas las celdas:
+
+```json
+{"ANIO":"2025","MES":"7","FORCE_REPROCESS":"false"}
+```
+
+El notebook valida los parámetros antes de iniciar el pipeline. Los valores
+vacíos o inválidos hacen fallar esa validación sin iniciar discovery ni tocar
+archivos. Invoca `run_pipeline` una sola vez, propaga los errores y muestra RUN_ID,
+estado y conteos de filas. No recrea el schema ni instala dependencias.
+
+### Notebook de QA
+
+Abre `notebooks/qa_ecommerce_danone.py`. Parámetros mínimos:
+
+```json
+{"ANIO":"2025","MES":"7","FAIL_ON_QA_ERROR":"true"}
+```
+
+Widgets opcionales, vacíos por defecto: `RUN_ID`, `LOGICAL_DATASET`, `BU`,
+`ID_INTERNO` e `ID_STORE`. Los filtros se pasan a `run_qa_validation` y se muestran
+sus catorce DataFrames, incluido el estado final. Con `FAIL_ON_QA_ERROR=true`, un
+estado `FAIL` hace fallar la tarea **después** de mostrar todos los resultados.
+`PASS_WITH_WARNINGS` no falla. Para inspección interactiva puedes ponerlo en
+`false`. El notebook QA no llama al ETL ni modifica tablas o archivos.
+
 ## Ejecución como job
 
-Usa una tarea Python script con origen Git y archivo `src/main.py`, o un notebook
-runner que invoque `run_from_widgets`. Ejemplo de parámetros de una tarea script:
+Crea una tarea de tipo **Notebook** con origen Git, repositorio
+`https://github.com/danielbep94/ecomm-etl.git`, rama `main`, y selecciona el notebook
+`notebooks/job_ecommerce_danone.py`. Usa el diccionario de parámetros anterior.
+Mantén **`max_concurrent_runs = 1`** para el job completo.
+
+Puedes añadir una segunda tarea Notebook con `notebooks/qa_ecommerce_danone.py`,
+dependiente de que la tarea ETL termine correctamente, y los mismos ANIO/MES.
+Deja RUN_ID vacío para revisar el snapshot persistido actual del periodo; puedes
+copiar un RUN_ID de la salida del ETL para una inspección específica.
+
+La entrada Python script `src/main.py` sigue disponible. Sus argumentos son:
 
 ```json
 ["--anio", "2025", "--mes", "7", "--force-reprocess", "false"]
 ```
 
-Equivalente desde un entorno Databricks con Spark/DBUtils disponibles:
-
 ```bash
 python src/main.py --anio 2025 --mes 7 --force-reprocess false
 ```
 
-Cada ejecución genera un solo RUN_ID antes de descubrir archivos. Se leen los
+Cada intento ETL genera un solo RUN_ID antes de descubrir archivos. Se leen los
 identificadores de job/task cuando existen; la ejecución interactiva usa valores
-nulos, intento 0 y trigger `INTERACTIVE`. Configura una única ejecución concurrente.
+nulos, intento 0 y trigger `INTERACTIVE`.
 
 ## Validación y carga
 
@@ -327,7 +381,7 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[dev]'
 pytest -q
-ruff check conf logs src tests
+ruff check conf logs src notebooks tests
 ```
 
 Requieren Java compatible con el Spark instalado. Las pruebas cubren descubrimiento,
@@ -347,7 +401,7 @@ los JARs se descargaron de Maven Central y se verificaron sus digests publicados
 
 ### Validación realizada
 
-La implementación se verificó con **68 pruebas aprobadas, 0 fallos y 0 omitidas**
+La implementación, el tracker adjunto y los dos notebooks se verificaron con **79 pruebas aprobadas, 0 fallos y 0 omitidas**
 en Python 3.12, Spark 4.0.4 y Delta Lake 4.0.1. Incluye un lote completo de cuatro
 CSV con cargas Delta y movimientos locales de archivos reales. Ruff y la
 construcción del wheel también se verificaron. Snowflake se ejercitó con dobles

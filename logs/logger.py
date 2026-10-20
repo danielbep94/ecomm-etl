@@ -7,6 +7,12 @@ from src.run_tracking import sanitize_error_message
 
 
 class BusinessLogger(logging.LoggerAdapter):
+    def process(self, msg, kwargs):
+        if not str(msg).startswith("RUN_ID="):
+            prefix = " | ".join(f"{key}={value}" for key, value in self.extra.items() if value is not None)
+            msg = f"{prefix} | STAGE=TRACKING | {msg}"
+        return msg, kwargs
+
     def event(self, stage, status, dataset=None, source_file=None, **fields):
         context = {
             **self.extra,
