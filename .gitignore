@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Configuración y credenciales locales
+.env
+.env.*
+!.env.example
+.databrickscfg
+.databricks/
+
+# Notebooks y editor
+.ipynb_checkpoints/
+.idea/
+.vscode/
+.DS_Store
