@@ -324,8 +324,13 @@ def _validate_catalog_history(frame, dataset, run_id):
         .count()
     ):
         raise PipelineError("Catalog snapshot keys or validity metadata are missing.", "SNOWFLAKE_LOAD_ERROR")
-    if frame.groupBy("RUN_ID", primary).count().where(F.col("count") > 1).limit(1).count():
-        raise PipelineError("Catalog history contains duplicate versioned dimension keys.", "SNOWFLAKE_LOAD_ERROR")
+    keys = [primary] if dataset == "STORE_CATALOG" else ["ID_INTERNO", "UPC", "ID_IMPORT", "SKU"]
+    for key in keys:
+        if frame.groupBy("RUN_ID", key).count().where(F.col("count") > 1).limit(1).count():
+            raise PipelineError(
+                f"Catalog history contains duplicate versioned dimension keys: {dataset}.{key}.",
+                "SNOWFLAKE_LOAD_ERROR",
+            )
     active_runs = [row[0] for row in frame.where("IS_ACTIVE = true").select("RUN_ID").distinct().limit(2).collect()]
     if active_runs != [run_id]:
         raise PipelineError("The active dimension snapshot does not match this run.", "SNOWFLAKE_LOAD_ERROR")

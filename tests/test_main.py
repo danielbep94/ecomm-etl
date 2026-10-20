@@ -7,6 +7,8 @@ from conf import settings as C
 from src import main as M
 from src.run_tracking import PipelineError
 
+_REAL_CATALOG_DUPLICATE_VALIDATOR = M.V.validate_catalog_duplicates
+
 
 class Frame:
     def __init__(self, n=2):
@@ -229,9 +231,14 @@ def test_qa_uses_persisted_snapshots_without_incoming(spark, catalogs, monkeypat
     )
     monkeypatch.setattr(M.E, "list_incoming_files", Mock(side_effect=AssertionError("QA must not read incoming")))
     result = M.run_qa_validation(2025, 7, id_interno="1e0", spark=spark, dbutils=Mock())
-    assert len(result) == 16
+    assert len(result) == 17
     assert result["qa_final_status"].first().STATUS == "PASS"
     assert result["qa_product_catalog_coverage"].first().MATCHED_PRODUCT_ROWS == 1
+    joined = result["qa_joined_ecommerce_data"].collect()
+    assert len(joined) == 1
+    assert joined[0].PRODUCT_NOMBRE == "Product" and joined[0].STORE_CADENA == "Chain"
+    assert joined[0].PRODUCT_MATCHED and joined[0].STORE_MATCHED
+    assert joined[0].MONTO == 10.0
     M.E.list_incoming_files.assert_not_called()
 
 
@@ -353,3 +360,24 @@ def test_complete_csv_batch_real_delta_and_file_movement(spark, catalogs, tmp_pa
     finally:
         for table in tables:
             spark.sql(f"DROP TABLE IF EXISTS {table}")
+
+
+@pytest.mark.parametrize("dataset", ["EDP_CATALOG", "WATERS_CATALOG", "STORE_CATALOG"])
+def test_catalog_duplicates_block_every_business_write(pipeline, spark, catalogs, monkeypatch, dataset):
+    real_validate = _REAL_CATALOG_DUPLICATE_VALIDATOR
+    frames = dict(zip(C.SNOWFLAKE_CATALOG_TABLES, catalogs))
+    duplicate = frames[dataset].unionByName(frames[dataset])
+
+    def validate(frame, name, report, source):
+        return real_validate(duplicate, name, report, source) if name == dataset else 0
+
+    monkeypatch.setattr(M.V, "validate_catalog_duplicates", validate)
+    snowflake_load = Mock()
+    monkeypatch.setattr(M.L, "load_snowflake_period", snowflake_load)
+    with pytest.raises(M.V.ValidationError, match="failed validation"):
+        M.run_pipeline(2025, 7)
+    M.L.load_catalog_snapshot.assert_not_called()
+    M.L.load_monthly_delta.assert_not_called()
+    snowflake_load.assert_not_called()
+    pipeline["move"].assert_not_called()
+    assert pipeline["tracking"].call_args.args[3]["STATUS"] == "VALIDATION_FAILED"

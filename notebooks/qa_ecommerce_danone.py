@@ -1,11 +1,14 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # E-commerce Finance DANGO — QA persistido
+# MAGIC # E-commerce — QA persistido
 # MAGIC Define `ANIO` y `MES`; los filtros opcionales vacíos consultan el periodo completo.
 # MAGIC Este notebook lee Delta y Snowflake sin consultar `incoming` ni ejecutar cargas.
 # MAGIC `FAIL_ON_QA_ERROR=true` hace fallar la tarea después de mostrar los hallazgos
 # MAGIC cuando el estado final es `FAIL`. Las advertencias no hacen fallar el job.
 
+# MAGIC `qa_joined_ecommerce_data` muestra las ventas de Snowflake cruzadas con
+# MAGIC productos EDP/Waters y tiendas por RUN_ID + ID. Incluye atributos PRODUCT_*/STORE_*
+# MAGIC y las banderas PRODUCT_MATCHED/STORE_MATCHED para localizar claves sin catálogo.
 # MAGIC También concilia los tres catálogos Snowflake y verifica los joins por RUN_ID.
 
 # COMMAND ----------
@@ -80,9 +83,26 @@ qa_results = run_qa_validation(
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ## Ventas cruzadas con los catálogos
+# MAGIC Usa los filtros de periodo, BU, producto y tienda definidos arriba.
+
+# COMMAND ----------
+
+print("qa_joined_ecommerce_data")
+display(qa_results["qa_joined_ecommerce_data"])
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Resultados de validación
+
+# COMMAND ----------
+
 for _name, _dataframe in qa_results.items():
-    print(_name)
-    display(_dataframe)
+    if _name != "qa_joined_ecommerce_data":
+        print(_name)
+        display(_dataframe)
 
 # COMMAND ----------
 

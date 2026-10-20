@@ -586,6 +586,9 @@ def run_qa_validation(
         id_store=id_store,
     )
     star_qa = L.qa_snowflake_relationships(spark, sf, remote_catalogs)
+    joined_data = V.join_star_fact(
+        sf, remote_catalogs["EDP_CATALOG"], remote_catalogs["WATERS_CATALOG"], remote_catalogs["STORE_CATALOG"]
+    )
     failed = (
         not effective_run_id
         or source.count() == 0
@@ -597,7 +600,7 @@ def run_qa_validation(
         or any(coverage[k] for k in ["UNMATCHED_PRODUCT_ROWS", "UNMATCHED_STORE_ROWS", "UNKNOWN_BU_ROWS"])
         or coverage["FACT_ROWS"] != coverage["ROWS_AFTER_PRODUCT_JOIN"]
         or coverage["FACT_ROWS"] != coverage["ROWS_AFTER_STORE_JOIN"]
-        or (C.CATALOG_DUPLICATE_SEVERITY == "ERROR" and duplicate_detail.limit(1).count() > 0)
+        or duplicate_detail.limit(1).count() > 0
         or (C.CROSS_CATALOG_COLLISION_SEVERITY == "ERROR" and collisions.limit(1).count() > 0)
         or (C.FACT_BUSINESS_KEY_DUPLICATE_SEVERITY == "ERROR" and fact_duplicates.limit(1).count() > 0)
         or findings.where(F.col("VALIDATION_STATUS") == "FAIL").limit(1).count() > 0
@@ -634,6 +637,7 @@ def run_qa_validation(
         "qa_delta_snowflake_reconciliation": delta_sf,
         "qa_snowflake_catalog_reconciliation": catalog_qa,
         "qa_snowflake_star_relationships": star_qa,
+        "qa_joined_ecommerce_data": joined_data,
         "qa_final_status": spark.createDataFrame(
             [(anio, mes, effective_run_id, status)], "ANIO int, MES int, RUN_ID string, STATUS string"
         ),

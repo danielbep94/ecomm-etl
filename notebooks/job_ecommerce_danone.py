@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # E-commerce Finance DANGO — job mensual
+# MAGIC # E-commerce — job mensual
 # MAGIC Define `ANIO`, `MES` y `FORCE_REPROCESS` antes de ejecutar todas las celdas.
 # MAGIC El cómputo necesita las dependencias del proyecto, el conector Spark de
 # MAGIC Snowflake y acceso al scope documentado en README. No se instalan librerías

@@ -1,9 +1,30 @@
-# E-commerce Finance DANGO — Databricks / Snowflake
+# E-commerce — Databricks / Snowflake
 
 ETL mensual en Python y PySpark para cuatro CSV de e-commerce. Valida el lote
 completo, conserva snapshots de catálogos, reemplaza un solo periodo en Delta y
 Snowflake, registra el resultado terminal y permite consultar QA sin los archivos
 originales. El código de producción está en los ocho módulos solicitados.
+
+## Flujo de e-commerce
+
+El job valida primero los cuatro CSV completos: columnas y tipos, claves
+obligatorias, duplicados, periodos, BU, cobertura y conservación de filas en los
+joins. Un error bloquea todas las escrituras de negocio. Los catálogos no aceptan
+duplicados: `ID_INTERNO`, `UPC`, `ID_IMPORT` y `SKU` deben ser únicos dentro de cada
+catálogo de productos por snapshot; `ID_STORE` debe ser único en tiendas. Tanto
+copias idénticas como atributos conflictivos hacen fallar el lote; no se eliminan
+duplicados automáticamente ni se permite bajar su severidad a advertencia.
+
+Tras pasar la validación, se persisten las tablas Delta y se concilia staging
+Snowflake. Los tres MERGE de catálogos y el reemplazo mensual de la fact se
+confirman en **una transacción Snowflake** solamente si las conciliaciones y los
+joins pasan. Un fallo dentro de esa transacción revierte los cuatro cambios.
+Los commits de Delta, la creación de tablas, DBFS y el tracker son independientes.
+Las advertencias de montos/unidades negativos se conservan como ajustes válidos.
+
+El notebook QA cruza la fact ya cargada en Snowflake con productos y tiendas de
+la misma versión y devuelve **`qa_joined_ecommerce_data`**, además de los controles.
+No depende de los CSV ni ejecuta una nueva carga.
 
 ## Probar con los archivos de tu captura
 
@@ -290,7 +311,8 @@ Abre `notebooks/qa_ecommerce_danone.py`. Parámetros mínimos:
 
 Widgets opcionales, vacíos por defecto: `RUN_ID`, `LOGICAL_DATASET`, `BU`,
 `ID_INTERNO` e `ID_STORE`. Los filtros se pasan a `run_qa_validation` y se muestran
-sus dieciséis DataFrames, incluido el estado final. Con `FAIL_ON_QA_ERROR=true`, un
+sus diecisiete DataFrames, empezando por los datos cruzados e incluyendo el estado
+final. Con `FAIL_ON_QA_ERROR=true`, un
 estado `FAIL` hace fallar la tarea **después** de mostrar todos los resultados.
 `PASS_WITH_WARNINGS` no falla. Para inspección interactiva puedes ponerlo en
 `false`. El notebook QA no llama al ETL ni modifica tablas o archivos.
@@ -419,8 +441,25 @@ También admite `run_id`. Los resultados son `qa_pipeline_history`,
 `qa_product_catalog_coverage`, `qa_store_catalog_coverage`,
 `qa_fact_duplicate_summary`, `qa_negative_values`, `qa_join_multiplication_check`,
 `qa_source_delta_reconciliation`, `qa_delta_snowflake_reconciliation`,
-`qa_snowflake_catalog_reconciliation`, `qa_snowflake_star_relationships` y
+`qa_snowflake_catalog_reconciliation`, `qa_snowflake_star_relationships`,
+`qa_joined_ecommerce_data` y
 `qa_final_status` (`PASS`, `PASS_WITH_WARNINGS` o `FAIL`). QA es de solo lectura.
+
+Para consultar los datos cruzados desde Python:
+
+```python
+display(qa["qa_joined_ecommerce_data"])
+```
+
+El resultado conserva las columnas de la fact y añade `PRODUCT_*`, `STORE_*`,
+`PRODUCT_MATCHED` y `STORE_MATCHED`. El join de productos usa
+`RUN_ID + ID_INTERNO + NORMALIZED_BU`; el de tiendas usa `RUN_ID + ID_STORE`.
+Conserva las ventas sin coincidencia, con atributos nulos y bandera falsa, para
+poder investigarlas. QA también detecta filas multiplicadas por claves duplicadas.
+Una misma clave en distintos RUN_ID representa versiones históricas y no es un
+duplicado dentro de un snapshot. Los filtros de periodo, BU y IDs también se
+aplican al resultado cruzado. El notebook muestra todos los resultados antes de
+fallar la tarea cuando QA devuelve FAIL.
 
 Staging y curated conservan la última versión de cada mes. Tras un reproceso,
 consultar QA de un RUN_ID reemplazado no reconstruye su antigua fact: mostrará
@@ -457,7 +496,7 @@ los JARs se descargaron de Maven Central y se verificaron sus digests publicados
 
 ### Validación realizada
 
-La suite completa terminó con **89 pruebas aprobadas, 0 fallos y 0 omitidas**.
+La suite completa terminó con **97 pruebas aprobadas, 0 fallos y 0 omitidas**.
 Las pruebas locales usan Python 3.12, Spark 4.0.4 y Delta Lake 4.0.1 e incluyen
 un lote completo de cuatro CSV con cargas Delta y movimientos locales de archivos
 reales. La suite también comprueba creación de las cuatro tablas, rechazo de

@@ -371,7 +371,7 @@ def validate_catalog_duplicates(frame, dataset, report, source=None):
             rule,
             stats.ROWS or 0,
             category="DUPLICATE",
-            severity=C.CATALOG_DUPLICATE_SEVERITY,
+            severity="ERROR",
             source=source,
             column="+".join(keys),
             sample=_sample(detail, keys + ["N", "CLASSIFICATION"]) if stats.KEYS else None,
@@ -384,7 +384,7 @@ def validate_catalog_duplicates(frame, dataset, report, source=None):
                 rule=rule,
                 category="DUPLICATE",
                 source=source,
-                severity=C.CATALOG_DUPLICATE_SEVERITY,
+                severity="ERROR",
             )
         if len(keys) == 1 and keys[0] in {"ID_STORE", "ID_INTERNO"}:
             primary_count = stats.KEYS
@@ -758,3 +758,27 @@ def versioned_coverage_metrics(fact, edp, waters, stores):
             F.col("NORMALIZED_BU").isNull() | ~F.col("NORMALIZED_BU").isin("EDP", "WATERS")
         ).count(),
     }
+
+
+def join_star_fact(fact, edp, waters, stores):
+    """Return sales with product/store attributes from the same validated run.
+
+    Keep unmatched and multiplying joins visible for QA; never deduplicate them.
+    """
+    attributes = [c for c in C.PRODUCT_COLUMNS if c != "ID_INTERNO"]
+    products = (
+        edp.select("RUN_ID", *C.PRODUCT_COLUMNS)
+        .withColumn("NORMALIZED_BU", F.lit("EDP"))
+        .unionByName(waters.select("RUN_ID", *C.PRODUCT_COLUMNS).withColumn("NORMALIZED_BU", F.lit("WATERS")))
+        .select("RUN_ID", "ID_INTERNO", "NORMALIZED_BU", *[F.col(c).alias("PRODUCT_" + c) for c in attributes])
+        .withColumn("PRODUCT_MATCHED", F.lit(True))
+    )
+    store_attributes = [c for c in C.STORE_EXPECTED_COLUMNS if c != "ID_STORE"]
+    store_rows = stores.select(
+        "RUN_ID", "ID_STORE", *[F.col(c).alias("STORE_" + c) for c in store_attributes]
+    ).withColumn("STORE_MATCHED", F.lit(True))
+    return (
+        fact.join(products, ["RUN_ID", "ID_INTERNO", "NORMALIZED_BU"], "left")
+        .join(store_rows, ["RUN_ID", "ID_STORE"], "left")
+        .fillna(False, subset=["PRODUCT_MATCHED", "STORE_MATCHED"])
+    )

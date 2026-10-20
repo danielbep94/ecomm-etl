@@ -134,7 +134,16 @@ class Cursor:
         pass
 
 
-@pytest.mark.parametrize("fail", [None, "INSERT", "MERGE INTO PRD_MDP.MDP_STG.CATALOG_WATERS", "relationships"])
+@pytest.mark.parametrize(
+    "fail",
+    [
+        None,
+        "INSERT",
+        "MERGE INTO PRD_MDP.MDP_STG.CATALOG_WATERS",
+        "relationships",
+        "CREATE TRANSIENT TABLE PRD_MDP.MDP_STG.CATALOG_WATERS",
+    ],
+)
 def test_snowflake_transaction_and_rollback(spark, star_payloads, monkeypatch, fail):
     fact, catalogs, run_id = star_payloads
     payloads = {C.SNOWFLAKE_CATALOG_TABLES[k]: v for k, v in catalogs.items()}
@@ -171,7 +180,15 @@ def test_snowflake_transaction_and_rollback(spark, star_payloads, monkeypatch, f
         assert result["reconciliation_status"] == "PASS"
         assert len(result["catalog_metrics"]) == 3
         assert result["star_relationships"]["status"] == "PASS"
+        assert sum(sql.startswith("MERGE INTO") for sql in cursor.commands) == 3
+        assert sum(sql.startswith("DELETE FROM") for sql in cursor.commands) == 1
+        assert sum(sql.startswith("INSERT INTO") for sql in cursor.commands) == 1
     assert observed["target_rows_before"] == 2
+    if fail and fail.startswith("CREATE TRANSIENT"):
+        assert "BEGIN" not in cursor.commands
+        assert not any(sql.startswith(("MERGE", "DELETE", "INSERT", "COMMIT")) for sql in cursor.commands)
+        assert sum(sql.startswith("DROP TABLE IF EXISTS") for sql in cursor.commands) == 1
+        return
     assert cursor.commands.count("BEGIN") == 1
     assert ("ROLLBACK" in cursor.commands) == bool(fail)
     assert ("COMMIT" in cursor.commands) != bool(fail)
@@ -296,3 +313,64 @@ def test_published_ddl_matches_loaded_star_schemas(star_payloads):
         assert match, table
         fields = [line.strip().rstrip(",") for line in match[1].splitlines()]
         assert fields == [field.name + " " + L._sql_type(field.dataType) for field in frame.schema]
+
+
+@pytest.mark.parametrize("dataset", ["EDP_CATALOG", "WATERS_CATALOG"])
+def test_history_rejects_duplicate_product_codes_with_distinct_ids(star_payloads, dataset):
+    _, catalogs, run_id = star_payloads
+    history = catalogs[dataset]
+    extra = history.where(F.col("RUN_ID") == run_id).withColumn("ID_INTERNO", F.col("ID_INTERNO") + 100)
+    with pytest.raises(PipelineError, match="UPC"):
+        L._validate_catalog_history(history.unionByName(extra), dataset, run_id)
+
+
+def test_qa_returns_actual_historical_joined_sales(star_payloads):
+    from src import transform as V
+
+    fact, catalogs, _ = star_payloads
+    fact = fact.withColumn("RUN_ID", F.lit("older-run")).withColumn("ID_INTERNO", F.lit(1).cast("long"))
+    edp = catalogs["EDP_CATALOG"].withColumn(
+        "NOMBRE", F.when(F.col("RUN_ID") == "older-run", "EDP historical").otherwise("EDP current")
+    )
+    waters = (
+        catalogs["WATERS_CATALOG"]
+        .withColumn("ID_INTERNO", F.lit(1).cast("long"))
+        .withColumn("NOMBRE", F.when(F.col("RUN_ID") == "older-run", "Waters historical").otherwise("Waters current"))
+    )
+    stores = catalogs["STORE_CATALOG"].withColumn(
+        "CADENA", F.when(F.col("RUN_ID") == "older-run", "Historical chain").otherwise("Current chain")
+    )
+    joined = V.join_star_fact(fact, edp, waters, stores)
+    rows = {row.NORMALIZED_BU: row for row in joined.collect()}
+    assert joined.count() == fact.count() == 2
+    assert rows["EDP"].PRODUCT_NOMBRE == "EDP historical"
+    assert rows["WATERS"].PRODUCT_NOMBRE == "Waters historical"
+    assert all(
+        row.STORE_CADENA == "Historical chain" and row.PRODUCT_MATCHED and row.STORE_MATCHED for row in rows.values()
+    )
+    assert L.frame_metrics(joined) == L.frame_metrics(fact)
+
+
+def test_qa_join_keeps_sales_with_missing_or_duplicated_catalog_keys(star_payloads):
+    from src import transform as V
+
+    fact, catalogs, run_id = star_payloads
+    edp, waters, stores = catalogs.values()
+    no_match = V.join_star_fact(
+        fact, edp, waters.where(F.col("RUN_ID") != run_id), stores.where(F.col("RUN_ID") != run_id)
+    )
+    rows = {row.NORMALIZED_BU: row for row in no_match.collect()}
+    assert len(rows) == 2
+    assert rows["EDP"].PRODUCT_MATCHED
+    assert not rows["WATERS"].PRODUCT_MATCHED and rows["WATERS"].PRODUCT_NOMBRE is None
+    assert all(not row.STORE_MATCHED and row.STORE_CADENA is None for row in rows.values())
+    duplicated = edp.unionByName(edp.where(F.col("RUN_ID") == run_id))
+    assert V.join_star_fact(fact, duplicated, waters, stores).count() == 3
+    assert (
+        L.qa_snowflake_relationships(
+            fact.sparkSession, fact, {"EDP_CATALOG": duplicated, "WATERS_CATALOG": waters, "STORE_CATALOG": stores}
+        )
+        .first()
+        .STATUS
+        == "FAIL"
+    )

@@ -157,3 +157,7 @@ Ejecuta `notebooks/job_ecommerce_danone.py` y después
 `notebooks/qa_ecommerce_danone.py` con el mismo ANIO/MES. QA incluye
 `qa_snowflake_catalog_reconciliation` y `qa_snowflake_star_relationships` además
 de los controles existentes; no requiere volver a subir los CSV.
+`qa_joined_ecommerce_data` devuelve las ventas Snowflake con los atributos de
+productos/tiendas y banderas de coincidencia usando los joins anteriores.
+Los catálogos rechazan cualquier duplicado por snapshot, incluso registros
+idénticos; las claves de versiones históricas se validan antes del staging.
