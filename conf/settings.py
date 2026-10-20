@@ -1,0 +1,107 @@
+"""Non-secret configuration for the monthly Finance DANGO pipeline."""
+
+SCHEMA_NAME = "ecomm_dph"
+BASE_PATH = f"dbfs:/FileStore/tables/{SCHEMA_NAME}"
+INCOMING_PATH = f"{BASE_PATH}/incoming"
+CURRENT_PATH = f"{BASE_PATH}/current"
+PIPELINE_NAME = "ecommerce_danone"
+PIPELINE_VERSION = "1.0.0"
+PIPELINE_ENVIRONMENT = "PROD"
+PIPELINE_SOURCE_NAME = "DBFS_MONTHLY_CSV"
+EXPECTED_FILE_COUNT = 4
+FACT_FILE_TEMPLATE = "TBL_BI_BQ_FACTS_ECOMM_ONE_DANONE_FULL_{ANIO}.csv"
+FACT_FILE_PATTERN = r"^TBL_BI_BQ_FACTS_ECOMM_ONE_DANONE_FULL_(\d{4})\.csv$"
+EXPECTED_STATIC_FILES = {
+    "EDP_CATALOG": {
+        "expected_file_name": "edp_2004_TBL_BI_BQ_CAT_ECOMM_PRODUCTS_EDP.csv",
+        "pattern": r"^edp_2004_TBL_BI_BQ_CAT_ECOMM_PRODUCTS_EDP\.csv$",
+        "catalog_bu": "EDP",
+        "required": True,
+    },
+    "WATERS_CATALOG": {
+        "expected_file_name": "2006_TBL_BI_BQ_CAT_ECOMM_PRODUCTS_PET_BEC.csv",
+        "pattern": r"^2006_TBL_BI_BQ_CAT_ECOMM_PRODUCTS_PET_BEC\.csv$",
+        "catalog_bu": "WATERS",
+        "required": True,
+    },
+    "STORE_CATALOG": {
+        "expected_file_name": "TBL_BI_BQ_CAT_ECOMM_POS.csv",
+        "pattern": r"^TBL_BI_BQ_CAT_ECOMM_POS\.csv$",
+        "required": True,
+    },
+}
+BU_NORMALIZATION = {
+    "EDP": "EDP",
+    "WATER": "WATERS",
+    "WATERS": "WATERS",
+    "PET": "WATERS",
+    "BEC": "WATERS",
+    "PET_BEC": "WATERS",
+}
+CATALOG_EDP_TABLE = "ecomm_dph.catalog_edp"
+CATALOG_WATERS_TABLE = "ecomm_dph.catalog_waters"
+CATALOG_STORE_TABLE = "ecomm_dph.catalog_store"
+FACT_STAGING_TABLE = "ecomm_dph.fact_ecommerce_staging"
+FACT_CURATED_TABLE = "ecomm_dph.fact_ecommerce_danone"
+VALIDATION_RESULTS_TABLE = "ecomm_dph.ecommerce_validation_results"
+PIPELINE_RUN_HISTORY_TABLE = "PRD_MDP.MDP_STG.PIPELINE_RUNS"
+TARGET_SNOWFLAKE_TABLE = "PRD_MDP.MDP_STG.FACT_ecommerce_danone"
+ROW_COUNT_TOLERANCE = 0
+MONTO_TOLERANCE = 0.01
+VALIDATION_SAMPLE_LIMIT = 20
+NEGATIVE_UNITS_SEVERITY = "WARNING"
+NEGATIVE_AMOUNT_SEVERITY = "WARNING"
+CROSS_CATALOG_COLLISION_SEVERITY = "ERROR"
+CATALOG_DUPLICATE_SEVERITY = "ERROR"
+FACT_EXACT_DUPLICATE_SEVERITY = "ERROR"
+FACT_BUSINESS_KEY_DUPLICATE_SEVERITY = "ERROR"
+HEADER_ORDER_SEVERITY = "WARNING"
+MISSING_VALUES = ("", "NULL", "NONE", "N/A", "NA")
+CSV_OPTIONS = {"delimiter": ",", "quote": '"', "encoding": "UTF-8", "multiLine": False}
+PRODUCT_COLUMNS = [
+    "ID_INTERNO",
+    "UPC",
+    "ID_IMPORT",
+    "NOMBRE",
+    "MARCA",
+    "CATEGORIA",
+    "DESCRIPCION",
+    "EMPAQUE",
+    "FABRICANTE",
+    "FACTOR_CONVERSION",
+    "SABOR",
+    "SKU",
+    "TAMANO",
+]
+EDP_EXPECTED_COLUMNS = list(PRODUCT_COLUMNS)
+WATERS_EXPECTED_COLUMNS = list(PRODUCT_COLUMNS)
+EDP_EXPECTED_TYPES = {
+    c: (
+        "int64"
+        if c in ("ID_INTERNO", "UPC", "ID_IMPORT", "SKU")
+        else "float64"
+        if c == "FACTOR_CONVERSION"
+        else "object"
+    )
+    for c in EDP_EXPECTED_COLUMNS
+}
+WATERS_EXPECTED_TYPES = dict(EDP_EXPECTED_TYPES)
+STORE_EXPECTED_COLUMNS = ["ID_STORE", "TYPE", "CADENA", "CANAL"]
+STORE_EXPECTED_TYPES = {"ID_STORE": "int64", "TYPE": "object", "CADENA": "object", "CANAL": "object"}
+FACT_EXPECTED_COLUMNS = ["TIME_ID", "ID_STORE", "ID_INTERNO", "UNIDADES", "MONTO", "BU"]
+FACT_EXPECTED_TYPES = {
+    "TIME_ID": "int64",
+    "ID_STORE": "int64",
+    "ID_INTERNO": "int64",
+    "UNIDADES": "float64",
+    "MONTO": "float64",
+    "BU": "object",
+}
+PRODUCT_MANDATORY = ["ID_INTERNO", "UPC", "ID_IMPORT", "NOMBRE", "MARCA", "CATEGORIA", "FACTOR_CONVERSION", "SKU"]
+SOURCE_DEFINITIONS = {
+    "EDP_CATALOG": (EDP_EXPECTED_COLUMNS, EDP_EXPECTED_TYPES, PRODUCT_MANDATORY),
+    "WATERS_CATALOG": (WATERS_EXPECTED_COLUMNS, WATERS_EXPECTED_TYPES, PRODUCT_MANDATORY),
+    "STORE_CATALOG": (STORE_EXPECTED_COLUMNS, STORE_EXPECTED_TYPES, STORE_EXPECTED_COLUMNS),
+    "ECOMMERCE_FACT": (FACT_EXPECTED_COLUMNS, FACT_EXPECTED_TYPES, FACT_EXPECTED_COLUMNS),
+}
+PRODUCT_COMPARISON_COLUMNS = ["UPC", "SKU", "NOMBRE", "MARCA", "CATEGORIA", "FACTOR_CONVERSION", "TAMANO"]

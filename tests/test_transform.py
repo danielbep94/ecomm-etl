@@ -1,0 +1,171 @@
+import pytest
+from pyspark.sql import functions as F
+
+from conf import settings as C
+from src import transform as V
+
+
+@pytest.mark.parametrize(
+    "value,kind,status",
+    [
+        ("9223372036854775807", "int64", "VALID"),
+        ("9223372036854775808", "int64", "INVALID"),
+        ("-9223372036854775808", "int64", "VALID"),
+        ("-9223372036854775809", "int64", "INVALID"),
+        ("1.000000000000000000001", "int64", "INVALID"),
+        ("1.0", "int64", "VALID"),
+        ("1e3", "int64", "VALID"),
+        ("1.5", "int64", "INVALID"),
+        ("oops", "float64", "INVALID"),
+        ("NaN", "float64", "INVALID"),
+        ("inf", "float64", "INVALID"),
+        ("1e9999", "float64", "INVALID"),
+        ("-0.25", "float64", "VALID"),
+        ("NULL", "int64", "MISSING"),
+        (None, "float64", "MISSING"),
+    ],
+)
+def test_numeric_validation(value, kind, status):
+    assert V.parse_numeric(value, kind)[1] == status
+
+
+@pytest.mark.parametrize("args", [(True, 1, False), (25, 1, False), (2025, 13, False), (2025, 1, "yes")])
+def test_bad_parameters(args):
+    with pytest.raises(V.ValidationError):
+        V.validate_parameters(*args)
+
+
+def test_safe_boolean_conversion():
+    assert V.validate_parameters("2025", "07", "false") == (2025, 7, False)
+    assert V.validate_parameters(2026, 1, "TRUE") == (2026, 1, True)
+
+
+def test_headers(spark):
+    report = V.ValidationReport(spark, "r", 2025, 7)
+    assert V.validate_headers(["\ufeff B ", "A"], ["A", "B"], report, "X", "file") == ["B", "A"]
+    assert not report.failed
+    assert V.validate_headers(["A", "A", "OTHER"], ["A", "B"], report, "X", "file") is None
+    assert report.failed
+
+
+def test_mandatory_missing_and_invalid_numeric_separate(spark):
+    frame = spark.createDataFrame(
+        [("NA", "Online", "Chain", "Digital", None), ("oops", "Online", "Chain", "Digital", None)],
+        "ID_STORE string, TYPE string, CADENA string, CANAL string, _CSV_ERROR string",
+    )
+    report, cache = V.ValidationReport(spark, "r", 2025, 7), []
+    try:
+        typed, count = V.validate_and_cast_source(frame, "STORE_CATALOG", report, "stores.csv", cache)
+        assert typed is None and count == 2
+        rules = {r["VALIDATION_RULE"]: r["AFFECTED_ROWS"] for r in report.records}
+        assert rules["MANDATORY_ID_STORE"] == 1
+        assert rules["TYPE_ID_STORE"] == 1
+    finally:
+        for f in cache:
+            f.unpersist()
+
+
+def test_duplicate_classifications(spark, catalogs, product_rows):
+    edp, _, _ = catalogs
+    frame = spark.createDataFrame(
+        [
+            product_rows(),
+            product_rows(),
+            product_rows(2, 22, 222, description="A"),
+            product_rows(2, 22, 222, description="B"),
+            product_rows(3, 33, 333, name="A"),
+            product_rows(3, 33, 333, name="B"),
+        ],
+        edp.schema,
+    )
+    rows = V.duplicate_groups(frame, ["ID_INTERNO"], C.EDP_EXPECTED_COLUMNS, C.PRODUCT_COMPARISON_COLUMNS).collect()
+    assert {r.ID_INTERNO: r.CLASSIFICATION for r in rows} == {
+        1: "EXACT_DUPLICATE",
+        2: "DUPLICATE_KEY_SAME_ATTRIBUTES",
+        3: "DUPLICATE_KEY_CONFLICTING_ATTRIBUTES",
+    }
+    report = V.ValidationReport(spark, "r", 2025, 7)
+    assert V.validate_catalog_duplicates(frame, "EDP_CATALOG", report) == 3
+    assert report.failed
+    assert report.dataframe().where("KEY_VALUE IS NOT NULL").count() > 0
+
+
+def test_cross_catalog_collisions(spark, catalogs):
+    edp, _, _ = catalogs
+    assert V.cross_catalog_collisions(edp, edp, "ID_INTERNO").first().CLASSIFICATION == "CROSS_CATALOG_SAME_PRODUCT"
+    changed = edp.withColumn("NOMBRE", F.lit("Different"))
+    assert (
+        V.cross_catalog_collisions(edp, changed, "ID_INTERNO").first().CLASSIFICATION
+        == "CROSS_CATALOG_CONFLICTING_PRODUCT"
+    )
+
+
+def test_period_filtering_unknown_bu_and_mixed_dates(spark):
+    frame = spark.createDataFrame(
+        [
+            (202507, 1, 1, 1.0, 10.0, " edp "),
+            (202508, 1, 1, 1.0, 20.0, "PET"),
+            (20250731, 1, 1, 1.0, 10.0, "unknown"),
+            (20250230, 1, 1, 1.0, 10.0, "EDP"),
+            (202607, 1, 1, 1.0, 10.0, "EDP"),
+        ],
+        "TIME_ID long, ID_STORE long, ID_INTERNO long, UNIDADES double, MONTO double, BU string",
+    )
+    report = V.ValidationReport(spark, "r", 2025, 7)
+    monthly, metrics = V.detect_fact_period(frame, 2025, 7, report)
+    assert monthly.count() == 2 and metrics["SOURCE_ANNUAL_ROWS"] == 5
+    assert metrics["INVALID_TIME_ID_ROWS"] == 1 and metrics["UNKNOWN_BU_ROWS"] == 1
+    assert {r["VALIDATION_RULE"] for r in report.records if r["VALIDATION_STATUS"] == "FAIL"} >= {
+        "CONSISTENT_TIME_ID_FORMAT",
+        "ANNUAL_SOURCE_YEAR",
+        "KNOWN_BU",
+        "TIME_ID_FORMAT",
+    }
+
+
+def test_missing_references_and_join_multiplication(spark, catalogs):
+    edp, waters, stores = catalogs
+    fact = spark.createDataFrame(
+        [(202507, 1, 1, 1.0, 10.0, "EDP"), (202507, 999, 999, 1.0, 10.0, "EDP")],
+        "TIME_ID long, ID_STORE long, ID_INTERNO long, UNIDADES double, MONTO double, BU string",
+    )
+    fact = V.normalize_bu(fact)
+    report = V.ValidationReport(spark, "r", 2025, 7)
+    metrics = V.validate_references(fact, edp.unionByName(edp), waters, stores, report)
+    assert metrics["UNMATCHED_PRODUCT_ROWS"] == 1 and metrics["UNMATCHED_STORE_ROWS"] == 1
+    assert metrics["ROWS_AFTER_PRODUCT_JOIN"] == 3
+    assert report.error_type == "REFERENTIAL_VALIDATION_ERROR"
+    assert report.dataframe().where("VALIDATION_CATEGORY='REFERENTIAL_DETAIL'").count() > 0
+
+
+def test_fact_duplicates_and_negative_warnings(spark):
+    fact = spark.createDataFrame(
+        [(202507, 1, 1, -1.0, -10.0, "EDP"), (202507, 1, 1, -1.0, -10.0, "EDP")],
+        "TIME_ID long, ID_STORE long, ID_INTERNO long, UNIDADES double, MONTO double, BU string",
+    )
+    fact = V.normalize_bu(fact)
+    report = V.ValidationReport(spark, "r", 2025, 7)
+    assert V.validate_fact_duplicates(fact, report) == 1
+    assert V.validate_negative_values(fact, report) == (2, 2)
+    assert report.metrics()["warning_rules"] == 2
+
+
+def test_valid_explicit_types_preserve_exact_long_values(spark, catalogs):
+    edp, _, _ = catalogs
+    raw = edp.select(*[F.col(c).cast("string").alias(c) for c in C.EDP_EXPECTED_COLUMNS])
+    raw = (
+        raw.withColumn("UPC", F.lit("9223372036854775807"))
+        .withColumn("ID_IMPORT", F.lit("1.001e3"))
+        .withColumn("_CSV_ERROR", F.lit(None).cast("string"))
+    )
+    report, caches = V.ValidationReport(spark, "r", 2025, 7), []
+    try:
+        typed, count = V.validate_and_cast_source(raw, "EDP_CATALOG", report, "edp.csv", caches)
+        assert count == 1 and not report.failed
+        row = typed.first()
+        assert row.UPC == 9223372036854775807 and row.ID_IMPORT == 1001
+        assert typed.schema["UPC"].dataType.simpleString() == "bigint"
+        assert typed.schema["FACTOR_CONVERSION"].dataType.simpleString() == "double"
+    finally:
+        for frame in caches:
+            frame.unpersist()
