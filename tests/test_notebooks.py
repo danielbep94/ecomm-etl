@@ -94,6 +94,8 @@ def test_qa_displays_results_and_can_fail_task(monkeypatch, status, fail_flag, r
             "qa_source_delta_reconciliation",
             "qa_delta_snowflake_reconciliation",
             "qa_final_status",
+            "qa_snowflake_catalog_reconciliation",
+            "qa_snowflake_star_relationships",
         ]
     }
     output["qa_final_status"].first.return_value = SimpleNamespace(STATUS=status)
@@ -107,7 +109,7 @@ def test_qa_displays_results_and_can_fail_task(monkeypatch, status, fail_flag, r
             execute_notebook("qa_ecommerce_danone.py", values)
     else:
         runtime = execute_notebook("qa_ecommerce_danone.py", values)
-        assert runtime["display"].call_count == 14
+        assert runtime["display"].call_count == 16
     qa.assert_called_once()
     assert qa.call_args.args == (2025, 7)
     assert qa.call_args.kwargs["run_id"] is None and qa.call_args.kwargs["logical_dataset"] is None

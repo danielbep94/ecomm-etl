@@ -265,60 +265,207 @@ def _snowflake_multiset_difference(cursor, target, staging, columns, predicate):
     return int(cursor.fetchone()[0])
 
 
-def load_snowflake_period(spark, options, frame, anio, mes, run_id, observed_metrics=None):
-    """Stage with Spark, then DELETE/INSERT/reconcile/COMMIT on ONE native session."""
-    import uuid
+def _snowflake_contract_type_matches(field, actual):
+    kind, precision, scale = actual
+    kind = kind.upper()
+    if isinstance(field.dataType, (T.LongType, T.IntegerType, T.ShortType, T.ByteType)):
+        digits = 19 if isinstance(field.dataType, T.LongType) else 10
+        return (
+            kind in {"NUMBER", "FIXED", "DECIMAL", "NUMERIC"} and int(scale or 0) == 0 and int(precision or 0) >= digits
+        )
+    if isinstance(field.dataType, (T.DoubleType, T.FloatType)):
+        return kind in {"FLOAT", "DOUBLE", "REAL"}
+    if isinstance(field.dataType, T.StringType):
+        return kind in {"TEXT", "VARCHAR", "STRING"}
+    return kind == _sql_type(field.dataType)
 
+
+def ensure_snowflake_table(cursor, table, frame):
+    """Create a business table if absent; refuse incompatible existing schemas."""
+    table = sql_identifier(table)
+    database, schema, name = table.split(".")
+    ddl = ",".join(f"{sql_identifier(f.name)} {_sql_type(f.dataType)}" for f in frame.schema)
+    cursor.execute(f"CREATE TABLE IF NOT EXISTS {table} ({ddl})")
+    cursor.execute(
+        f"SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE "
+        f"FROM {database}.INFORMATION_SCHEMA.COLUMNS "
+        f"WHERE TABLE_SCHEMA='{schema.upper()}' AND TABLE_NAME='{name.upper()}' ORDER BY ORDINAL_POSITION"
+    )
+    actual = {row[0].upper(): (row[1], row[2], row[3]) for row in cursor.fetchall()}
+    if set(actual) != set(frame.columns) or any(
+        not _snowflake_contract_type_matches(field, actual[field.name]) for field in frame.schema
+    ):
+        raise PipelineError(
+            f"Existing Snowflake table {table} has an incompatible schema. "
+            "Review the star-model DDL; existing tables are never altered or replaced automatically.",
+            "SNOWFLAKE_LOAD_ERROR",
+        )
+
+
+def _cursor_count(cursor, table, predicate="1=1"):
+    cursor.execute(f"SELECT COUNT(*) FROM {sql_identifier(table)} WHERE {predicate}")
+    return int(cursor.fetchone()[0])
+
+
+def _validate_catalog_history(frame, dataset, run_id):
+    primary = "ID_STORE" if dataset == "STORE_CATALOG" else "ID_INTERNO"
+    required = set(C.SOURCE_DEFINITIONS[dataset][0]) | {"RUN_ID", "IS_ACTIVE", "VALID_FROM_UTC", "VALID_TO_UTC"}
+    if not required.issubset(frame.columns):
+        raise PipelineError("Snowflake catalogs require the complete Delta snapshot schema.", "SNOWFLAKE_LOAD_ERROR")
     if (
-        frame.where(F.col("ANIO").isNull() | F.col("MES").isNull() | (F.col("ANIO") != anio) | (F.col("MES") != mes))
+        frame.where(
+            F.col("RUN_ID").isNull()
+            | (F.trim(F.col("RUN_ID")) == "")
+            | F.col(primary).isNull()
+            | F.col("IS_ACTIVE").isNull()
+            | F.col("VALID_FROM_UTC").isNull()
+        )
         .limit(1)
         .count()
     ):
-        raise PipelineError("Snowflake input contains rows outside the requested period.", "SNOWFLAKE_LOAD_ERROR")
+        raise PipelineError("Catalog snapshot keys or validity metadata are missing.", "SNOWFLAKE_LOAD_ERROR")
+    if frame.groupBy("RUN_ID", primary).count().where(F.col("count") > 1).limit(1).count():
+        raise PipelineError("Catalog history contains duplicate versioned dimension keys.", "SNOWFLAKE_LOAD_ERROR")
+    active_runs = [row[0] for row in frame.where("IS_ACTIVE = true").select("RUN_ID").distinct().limit(2).collect()]
+    if active_runs != [run_id]:
+        raise PipelineError("The active dimension snapshot does not match this run.", "SNOWFLAKE_LOAD_ERROR")
+
+
+def _cursor_star_relationships(cursor):
+    """Check the entire fact so a dimension update cannot orphan older months."""
+    fact = sql_identifier(C.TARGET_SNOWFLAKE_TABLE)
+    edp = sql_identifier(C.SNOWFLAKE_CATALOG_TABLES["EDP_CATALOG"])
+    waters = sql_identifier(C.SNOWFLAKE_CATALOG_TABLES["WATERS_CATALOG"])
+    stores = sql_identifier(C.SNOWFLAKE_CATALOG_TABLES["STORE_CATALOG"])
+    before = _cursor_count(cursor, fact)
+    cursor.execute(
+        "SELECT COUNT(*) AS JOINED_ROWS, "
+        "COALESCE(SUM(IFF((f.NORMALIZED_BU='EDP' AND e.ID_INTERNO IS NOT NULL) OR "
+        "(f.NORMALIZED_BU='WATERS' AND w.ID_INTERNO IS NOT NULL),0,1)),0) AS MISSING_PRODUCTS, "
+        "COALESCE(SUM(IFF(s.ID_STORE IS NULL,1,0)),0) AS MISSING_STORES "
+        f"FROM {fact} f LEFT JOIN {edp} e ON f.RUN_ID=e.RUN_ID AND f.ID_INTERNO=e.ID_INTERNO AND f.NORMALIZED_BU='EDP' "
+        f"LEFT JOIN {waters} w ON f.RUN_ID=w.RUN_ID AND f.ID_INTERNO=w.ID_INTERNO AND f.NORMALIZED_BU='WATERS' "
+        f"LEFT JOIN {stores} s ON f.RUN_ID=s.RUN_ID AND f.ID_STORE=s.ID_STORE"
+    )
+    joined, missing_products, missing_stores = (int(value) for value in cursor.fetchone())
+    if joined != before or missing_products or missing_stores:
+        raise PipelineError(
+            "Snowflake star joins multiply facts or leave missing historical dimension keys.", "RECONCILIATION_ERROR"
+        )
+    return {
+        "fact_rows": before,
+        "joined_rows": joined,
+        "missing_product_rows": missing_products,
+        "missing_store_rows": missing_stores,
+        "status": "PASS",
+    }
+
+
+def load_snowflake_period(spark, options, frame, anio, mes, run_id, observed_metrics=None, catalog_frames=None):
+    """Stage three dimension histories and one thin fact; commit all four together."""
+    import uuid
+
+    from src.transform import star_fact
+
+    if catalog_frames is None or set(catalog_frames) != set(C.SNOWFLAKE_CATALOG_TABLES):
+        raise PipelineError(
+            "All three catalog histories are required for the Snowflake star load.", "SNOWFLAKE_LOAD_ERROR"
+        )
+    frame = star_fact(frame)
+    if (
+        frame.where(
+            F.col("ANIO").isNull()
+            | F.col("MES").isNull()
+            | (F.col("ANIO") != anio)
+            | (F.col("MES") != mes)
+            | F.col("RUN_ID").isNull()
+            | (F.col("RUN_ID") != run_id)
+        )
+        .limit(1)
+        .count()
+    ):
+        raise PipelineError("Snowflake fact input contains a different period or run.", "SNOWFLAKE_LOAD_ERROR")
     expected = frame_metrics(frame)
     if expected["rows"] == 0:
         raise PipelineError("Refusing an empty Snowflake period replacement.", "SNOWFLAKE_LOAD_ERROR")
-    target = sql_identifier(C.TARGET_SNOWFLAKE_TABLE)
-    staging = sql_identifier(target + "_STAGE_" + uuid.UUID(run_id).hex.upper())
-    columns = [sql_identifier(c) for c in frame.columns]
-    cols = ",".join(columns)
-    ddl = ",".join(f"{sql_identifier(f.name)} {_sql_type(f.dataType)}" for f in frame.schema)
+    for dataset, catalog in catalog_frames.items():
+        _validate_catalog_history(catalog, dataset, run_id)
+    payloads = {**catalog_frames, "ECOMMERCE_FACT": frame}
+    targets = {**C.SNOWFLAKE_CATALOG_TABLES, "ECOMMERCE_FACT": C.TARGET_SNOWFLAKE_TABLE}
+    suffix = uuid.UUID(run_id).hex.upper()
+    stages = {dataset: sql_identifier(table + "_STAGE_" + suffix) for dataset, table in targets.items()}
     predicate = f"ANIO={int(anio)} AND MES={int(mes)}"
-    cleanup_status = "NOT_CREATED"
+    counts = {dataset: catalog.count() for dataset, catalog in catalog_frames.items()}
+    counts["ECOMMERCE_FACT"] = expected["rows"]
+    catalog_metrics, cleanup, created = {}, {}, []
     with snowflake_connection(options) as conn:
         cursor = conn.cursor()
-        stage_created, in_transaction = False, False
+        in_transaction = False
         try:
-            cursor.execute(f"CREATE TABLE IF NOT EXISTS {target} ({ddl})")
-            cursor.execute(f"SELECT {cols} FROM {target} WHERE 1=0")
-            before = _cursor_metrics(cursor, target, predicate)
+            # All DDL is outside the explicit transaction. Only DML follows BEGIN.
+            for dataset, payload in payloads.items():
+                ensure_snowflake_table(cursor, targets[dataset], payload)
+            before = _cursor_metrics(cursor, C.TARGET_SNOWFLAKE_TABLE, predicate)
             if observed_metrics is not None:
                 observed_metrics.update(target_rows_before=before["rows"], target_amount_before=before["amount"])
-            cursor.execute(f"CREATE TRANSIENT TABLE {staging} ({ddl})")
-            stage_created = True
-            (
-                frame.write.format(SNOWFLAKE_SOURCE_NAME)
-                .options(**options)
-                .option("dbtable", staging)
-                .option("column_mapping", "name")
-                .mode("append")
-                .save()
-            )
-            staged = _cursor_metrics(cursor, staging, "1=1")
-            if not compare_metrics(expected, staged):
-                raise PipelineError("Snowflake staging metrics do not reconcile.", "RECONCILIATION_ERROR")
-            stage_frame = snowflake_read(spark, options, f"SELECT {cols} FROM {staging}")
-            if multiset_difference(frame, stage_frame):
-                raise PipelineError("Snowflake staging contains unexpected records.", "RECONCILIATION_ERROR")
+            for dataset, payload in payloads.items():
+                ddl = ",".join(f"{sql_identifier(f.name)} {_sql_type(f.dataType)}" for f in payload.schema)
+                cursor.execute(f"CREATE TRANSIENT TABLE {stages[dataset]} ({ddl})")
+                created.append(dataset)
+                (
+                    payload.write.format(SNOWFLAKE_SOURCE_NAME)
+                    .options(**options)
+                    .option("dbtable", stages[dataset])
+                    .option("column_mapping", "name")
+                    .mode("append")
+                    .save()
+                )
+                if _cursor_count(cursor, stages[dataset]) != counts[dataset]:
+                    raise PipelineError(
+                        "Snowflake staging row count differs from validated input.", "RECONCILIATION_ERROR"
+                    )
+                columns = ",".join(sql_identifier(c) for c in payload.columns)
+                staged_frame = snowflake_read(spark, options, f"SELECT {columns} FROM {stages[dataset]}")
+                if multiset_difference(payload, staged_frame):
+                    raise PipelineError("Snowflake staging contains unexpected records.", "RECONCILIATION_ERROR")
+            staged_metrics = _cursor_metrics(cursor, stages["ECOMMERCE_FACT"], "1=1")
+            if not compare_metrics(expected, staged_metrics):
+                raise PipelineError("Snowflake fact staging metrics do not reconcile.", "RECONCILIATION_ERROR")
             cursor.execute("BEGIN")
             in_transaction = True
+            for dataset, catalog in catalog_frames.items():
+                target, stage = targets[dataset], stages[dataset]
+                primary = "ID_STORE" if dataset == "STORE_CATALOG" else "ID_INTERNO"
+                columns = [sql_identifier(c) for c in catalog.columns]
+                updates = ",".join(f"t.{c}=s.{c}" for c in columns if c not in {"RUN_ID", primary})
+                cursor.execute(
+                    f"MERGE INTO {target} t USING {stage} s ON t.RUN_ID=s.RUN_ID AND t.{primary}=s.{primary} "
+                    f"WHEN MATCHED THEN UPDATE SET {updates} "
+                    f"WHEN NOT MATCHED THEN INSERT ({','.join(columns)}) VALUES ({','.join('s.' + c for c in columns)})"
+                )
+                actual_count = _cursor_count(cursor, target)
+                if actual_count != counts[dataset] or _snowflake_multiset_difference(
+                    cursor, target, stage, columns, "1=1"
+                ):
+                    raise PipelineError(
+                        "Snowflake dimension history differs from its Delta history.", "RECONCILIATION_ERROR"
+                    )
+                catalog_metrics[dataset] = {
+                    "source_rows": counts[dataset],
+                    "target_rows": actual_count,
+                    "status": "PASS",
+                }
+            target, stage = targets["ECOMMERCE_FACT"], stages["ECOMMERCE_FACT"]
+            columns = [sql_identifier(c) for c in frame.columns]
+            cols = ",".join(columns)
             cursor.execute(f"DELETE FROM {target} WHERE {predicate}")
-            cursor.execute(f"INSERT INTO {target} ({cols}) SELECT {cols} FROM {staging}")
+            cursor.execute(f"INSERT INTO {target} ({cols}) SELECT {cols} FROM {stage}")
             after = _cursor_metrics(cursor, target, predicate)
             if not compare_metrics(expected, after) or _snowflake_multiset_difference(
-                cursor, target, staging, columns, predicate
+                cursor, target, stage, columns, predicate
             ):
-                raise PipelineError("Snowflake target records do not reconcile; rolling back.", "RECONCILIATION_ERROR")
+                raise PipelineError("Snowflake fact records do not reconcile; rolling back.", "RECONCILIATION_ERROR")
+            relationships = _cursor_star_relationships(cursor)
             cursor.execute("COMMIT")
             in_transaction = False
         except Exception as exc:
@@ -328,20 +475,20 @@ def load_snowflake_period(spark, options, frame, anio, mes, run_id, observed_met
             if isinstance(exc, PipelineError):
                 raise
             raise PipelineError(
-                "Snowflake monthly load failed; rollback was attempted if a transaction was open.",
-                "SNOWFLAKE_LOAD_ERROR",
+                "Snowflake star load failed; rollback was attempted if a transaction was open.", "SNOWFLAKE_LOAD_ERROR"
             ) from None
         finally:
-            if stage_created:
+            for dataset in created:
                 try:
-                    cursor.execute(f"DROP TABLE IF EXISTS {staging}")
-                    cleanup_status = "DROPPED"
+                    cursor.execute(f"DROP TABLE IF EXISTS {stages[dataset]}")
+                    cleanup[dataset] = "DROPPED"
                 except Exception:
-                    cleanup_status = "CLEANUP_REQUIRED"
+                    cleanup[dataset] = "CLEANUP_REQUIRED"
             if observed_metrics is not None:
                 observed_metrics.update(
-                    staging_cleanup_status=cleanup_status,
-                    staging_table=staging if cleanup_status == "CLEANUP_REQUIRED" else None,
+                    catalog_metrics=catalog_metrics,
+                    staging_cleanup=cleanup,
+                    remaining_staging_tables=[stages[d] for d in created if cleanup[d] == "CLEANUP_REQUIRED"],
                 )
             with contextlib.suppress(Exception):
                 cursor.close()
@@ -353,20 +500,31 @@ def load_snowflake_period(spark, options, frame, anio, mes, run_id, observed_met
         "target_amount": after["amount"],
         "amount_difference": after["amount"] - expected["amount"],
         "reconciliation_status": "PASS",
-        "staging_cleanup_status": cleanup_status,
-        "staging_table": staging if cleanup_status == "CLEANUP_REQUIRED" else None,
+        "catalog_metrics": catalog_metrics,
+        "star_relationships": relationships,
+        "staging_cleanup": cleanup,
+        "remaining_staging_tables": [stages[d] for d in created if cleanup[d] == "CLEANUP_REQUIRED"],
     }
 
 
-def reconcile_delta_to_snowflake(spark, options, delta, anio, mes):
+def reconcile_delta_to_snowflake(spark, options, delta, anio, mes, catalog_frames=None):
+    from src.transform import star_fact
+
+    expected = star_fact(delta)
     target = snowflake_read(
         spark,
         options,
-        f"SELECT {','.join(delta.columns)} FROM {C.TARGET_SNOWFLAKE_TABLE} WHERE ANIO={int(anio)} AND MES={int(mes)}",
+        f"SELECT {','.join(expected.columns)} FROM {C.TARGET_SNOWFLAKE_TABLE} WHERE ANIO={int(anio)} AND MES={int(mes)}",
     )
-    left, right = frame_metrics(delta), frame_metrics(target)
-    if not compare_metrics(left, right) or multiset_difference(delta, target):
-        raise PipelineError("Committed Delta and Snowflake monthly records differ.", "RECONCILIATION_ERROR")
+    left, right = frame_metrics(expected), frame_metrics(target)
+    if not compare_metrics(left, right) or multiset_difference(expected, target):
+        raise PipelineError("Committed Delta and Snowflake monthly facts differ.", "RECONCILIATION_ERROR")
+    for dataset, catalog in (catalog_frames or {}).items():
+        remote = snowflake_read(
+            spark, options, f"SELECT {','.join(catalog.columns)} FROM {C.SNOWFLAKE_CATALOG_TABLES[dataset]}"
+        )
+        if multiset_difference(catalog, remote):
+            raise PipelineError("Committed Delta and Snowflake dimensions differ.", "RECONCILIATION_ERROR")
     return {
         "target_rows_after": right["rows"],
         "source_amount": left["amount"],
@@ -374,6 +532,43 @@ def reconcile_delta_to_snowflake(spark, options, delta, anio, mes):
         "amount_difference": right["amount"] - left["amount"],
         "reconciliation_status": "PASS",
     }
+
+
+def qa_snowflake_catalogs(spark, options, catalogs, id_interno=None, id_store=None):
+    from functools import reduce
+
+    frames, remotes = [], {}
+    for dataset, expected in catalogs.items():
+        remote = snowflake_read(
+            spark, options, f"SELECT {','.join(expected.columns)} FROM {C.SNOWFLAKE_CATALOG_TABLES[dataset]}"
+        )
+        ids = expected.select("RUN_ID").distinct()
+        remote = remote.join(ids, "RUN_ID", "inner")
+        key, value = ("ID_STORE", id_store) if dataset == "STORE_CATALOG" else ("ID_INTERNO", id_interno)
+        if value is not None:
+            remote = remote.where(F.col(key) == value)
+        differences = multiset_difference(expected, remote)
+        rows, target_rows = expected.count(), remote.count()
+        frames.append(
+            spark.createDataFrame(
+                [(dataset, rows, target_rows, differences, "PASS" if differences == 0 else "FAIL")],
+                "LOGICAL_DATASET string, DELTA_ROWS long, SNOWFLAKE_ROWS long, DIFFERENT_RECORDS long, STATUS string",
+            )
+        )
+        remotes[dataset] = remote
+    return reduce(lambda a, b: a.unionByName(b), frames), remotes
+
+
+def qa_snowflake_relationships(spark, fact, catalogs):
+    from src.transform import versioned_coverage_metrics
+
+    result = versioned_coverage_metrics(
+        fact, catalogs["EDP_CATALOG"], catalogs["WATERS_CATALOG"], catalogs["STORE_CATALOG"]
+    )
+    good = result["FACT_ROWS"] == result["ROWS_AFTER_PRODUCT_JOIN"] == result["ROWS_AFTER_STORE_JOIN"] and all(
+        result[k] == 0 for k in ["UNMATCHED_PRODUCT_ROWS", "UNMATCHED_STORE_ROWS", "UNKNOWN_BU_ROWS"]
+    )
+    return spark.createDataFrame([{**result, "STATUS": "PASS" if good else "FAIL"}])
 
 
 def qa_validation_results(spark, anio, mes, run_id=None, logical_dataset=None):

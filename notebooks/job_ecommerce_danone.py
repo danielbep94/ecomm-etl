@@ -5,6 +5,8 @@
 # MAGIC El cómputo necesita las dependencias del proyecto, el conector Spark de
 # MAGIC Snowflake y acceso al scope documentado en README. No se instalan librerías
 # MAGIC ni se repite la inicialización de Hive/DBFS desde este notebook.
+# MAGIC Tras validar el lote, el ETL crea si faltan los tres catálogos y la fact
+# MAGIC Snowflake. El DDL manual está en `conf/snowflake_business_tables.sql`.
 
 # COMMAND ----------
 

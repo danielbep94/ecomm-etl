@@ -355,6 +355,7 @@ def run_pipeline(anio, mes, force_reprocess=False, *, spark=None, dbutils=None):
         business_metrics["delta_metrics"]["target_rows_before"] = L.delta_period_metrics(
             spark, C.FACT_CURATED_TABLE, anio, mes
         )["rows"]
+        snowflake_catalogs = {}
         for dataset, table, bu in [
             ("EDP_CATALOG", C.CATALOG_EDP_TABLE, "EDP"),
             ("WATERS_CATALOG", C.CATALOG_WATERS_TABLE, "WATERS"),
@@ -364,6 +365,8 @@ def run_pipeline(anio, mes, force_reprocess=False, *, spark=None, dbutils=None):
                 typed[dataset], by_dataset[dataset][0], anio, mes, catalog_bu=bu, timestamp=timestamp
             )
             L.load_catalog_snapshot(spark, table, snapshot)
+            # Copy full Delta history so older monthly facts retain their joins.
+            snowflake_catalogs[dataset] = spark.table(table)
         staged = V.add_operational_metadata(monthly, by_dataset["ECOMMERCE_FACT"][0], anio, mes, timestamp=timestamp)
         L.load_monthly_delta(spark, C.FACT_STAGING_TABLE, staged, anio, mes)
         staging_rows = V.period_filter(spark.table(C.FACT_STAGING_TABLE), anio, mes).count()
@@ -382,12 +385,13 @@ def run_pipeline(anio, mes, force_reprocess=False, *, spark=None, dbutils=None):
             mes,
             run_context.run_id,
             observed_metrics=business_metrics["snowflake_metrics"],
+            catalog_frames=snowflake_catalogs,
         )
         business_metrics["snowflake_metrics"].update(sf_metrics)
         target_rows_before, target_rows_after = sf_metrics["target_rows_before"], sf_metrics["target_rows_after"]
         stage = "RECONCILIATION"
         business_metrics["snowflake_metrics"].update(
-            L.reconcile_delta_to_snowflake(spark, snowflake_options, delta, anio, mes)
+            L.reconcile_delta_to_snowflake(spark, snowflake_options, delta, anio, mes, snowflake_catalogs)
         )
         business_metrics["files_loaded"] = C.EXPECTED_FILE_COUNT
         stage = "FILE_MOVEMENT"
@@ -533,10 +537,11 @@ def run_qa_validation(
     if id_store is not None:
         stores = stores.where(F.col("ID_STORE") == id_store)
     expected_delta = V.enrich_fact(source, edp, waters, stores)
+    star_delta = V.star_fact(delta)
     sf = L.snowflake_read(
         spark,
         options,
-        f"SELECT {','.join(delta.columns)} FROM {C.TARGET_SNOWFLAKE_TABLE} WHERE ANIO={anio} AND MES={mes}",
+        f"SELECT {','.join(star_delta.columns)} FROM {C.TARGET_SNOWFLAKE_TABLE} WHERE ANIO={anio} AND MES={mes}",
     )
     sf = V.apply_qa_filters(sf, **filters)
     history = L.read_pipeline_history(spark, options, anio, mes, effective_run_id)
@@ -572,13 +577,23 @@ def run_qa_validation(
         "ROWS_BEFORE long, ROWS_AFTER_PRODUCT_JOIN long, ROWS_AFTER_STORE_JOIN long, STATUS string",
     )
     source_delta = L.qa_reconciliation(spark, expected_delta, delta, "SOURCE_DELTA")
-    delta_sf = L.qa_reconciliation(spark, delta, sf, "DELTA_SNOWFLAKE")
+    delta_sf = L.qa_reconciliation(spark, star_delta, sf, "DELTA_SNOWFLAKE")
+    catalog_qa, remote_catalogs = L.qa_snowflake_catalogs(
+        spark,
+        options,
+        {"EDP_CATALOG": edp, "WATERS_CATALOG": waters, "STORE_CATALOG": stores},
+        id_interno=id_interno,
+        id_store=id_store,
+    )
+    star_qa = L.qa_snowflake_relationships(spark, sf, remote_catalogs)
     failed = (
         not effective_run_id
         or source.count() == 0
         or period_report.failed
         or source_delta.first().STATUS == "FAIL"
         or delta_sf.first().STATUS == "FAIL"
+        or catalog_qa.where("STATUS = 'FAIL'").limit(1).count() > 0
+        or star_qa.first().STATUS == "FAIL"
         or any(coverage[k] for k in ["UNMATCHED_PRODUCT_ROWS", "UNMATCHED_STORE_ROWS", "UNKNOWN_BU_ROWS"])
         or coverage["FACT_ROWS"] != coverage["ROWS_AFTER_PRODUCT_JOIN"]
         or coverage["FACT_ROWS"] != coverage["ROWS_AFTER_STORE_JOIN"]
@@ -617,6 +632,8 @@ def run_qa_validation(
         "qa_join_multiplication_check": join_check,
         "qa_source_delta_reconciliation": source_delta,
         "qa_delta_snowflake_reconciliation": delta_sf,
+        "qa_snowflake_catalog_reconciliation": catalog_qa,
+        "qa_snowflake_star_relationships": star_qa,
         "qa_final_status": spark.createDataFrame(
             [(anio, mes, effective_run_id, status)], "ANIO int, MES int, RUN_ID string, STATUS string"
         ),

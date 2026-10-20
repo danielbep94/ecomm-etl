@@ -6,6 +6,8 @@
 # MAGIC `FAIL_ON_QA_ERROR=true` hace fallar la tarea después de mostrar los hallazgos
 # MAGIC cuando el estado final es `FAIL`. Las advertencias no hacen fallar el job.
 
+# MAGIC También concilia los tres catálogos Snowflake y verifica los joins por RUN_ID.
+
 # COMMAND ----------
 
 import sys

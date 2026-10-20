@@ -205,7 +205,22 @@ def test_qa_uses_persisted_snapshots_without_incoming(spark, catalogs, monkeypat
     monkeypatch.setattr(spark, "table", lambda name: tables[name])
     monkeypatch.setattr(M.L, "verify_hive_objects", lambda spark: spark.conf.set("spark.sql.session.timeZone", "UTC"))
     monkeypatch.setattr(M, "get_snowflake_options", lambda _: {})
-    monkeypatch.setattr(M.L, "snowflake_read", lambda *args: tables[C.FACT_CURATED_TABLE])
+
+    def snowflake_read(_, options, query):
+        remote = {
+            C.TARGET_SNOWFLAKE_TABLE: V.star_fact(tables[C.FACT_CURATED_TABLE]),
+            **{
+                C.SNOWFLAKE_CATALOG_TABLES[key]: tables[table]
+                for key, table in [
+                    ("EDP_CATALOG", C.CATALOG_EDP_TABLE),
+                    ("WATERS_CATALOG", C.CATALOG_WATERS_TABLE),
+                    ("STORE_CATALOG", C.CATALOG_STORE_TABLE),
+                ]
+            },
+        }
+        return next(frame for table, frame in remote.items() if "FROM " + table in query)
+
+    monkeypatch.setattr(M.L, "snowflake_read", snowflake_read)
     monkeypatch.setattr(
         M.L, "read_pipeline_history", lambda *args: spark.createDataFrame([("SUCCEEDED",)], "STATUS string")
     )
@@ -214,7 +229,7 @@ def test_qa_uses_persisted_snapshots_without_incoming(spark, catalogs, monkeypat
     )
     monkeypatch.setattr(M.E, "list_incoming_files", Mock(side_effect=AssertionError("QA must not read incoming")))
     result = M.run_qa_validation(2025, 7, id_interno="1e0", spark=spark, dbutils=Mock())
-    assert len(result) == 14
+    assert len(result) == 16
     assert result["qa_final_status"].first().STATUS == "PASS"
     assert result["qa_product_catalog_coverage"].first().MATCHED_PRODUCT_ROWS == 1
     M.E.list_incoming_files.assert_not_called()
@@ -306,6 +321,7 @@ def test_complete_csv_batch_real_delta_and_file_movement(spark, catalogs, tmp_pa
     monkeypatch.setattr(M.L, "read_pipeline_history", lambda *args: spark.createDataFrame([], "STATUS string"))
 
     def snowflake_load(spark, options, frame, *args, **kwargs):
+        assert set(kwargs["catalog_frames"]) == set(C.SNOWFLAKE_CATALOG_TABLES)
         metrics = M.L.frame_metrics(frame)
         return {"target_rows_before": 0, "target_rows_after": metrics["rows"], "reconciliation_status": "PASS"}
 

@@ -726,3 +726,35 @@ def qa_cross_catalog_collisions(edp, waters):
             for key in ["ID_INTERNO", "UPC", "ID_IMPORT", "SKU"]
         ],
     )
+
+
+def star_fact(frame):
+    """Project the Snowflake fact grain; descriptions belong to dimensions."""
+    columns = C.FACT_EXPECTED_COLUMNS + ["NORMALIZED_BU", "ANIO", "MES"] + C.FACT_OPERATIONAL_COLUMNS
+    if not set(columns).issubset(frame.columns):
+        raise PipelineError("The star fact is missing required source or audit columns.", "SNOWFLAKE_LOAD_ERROR")
+    return frame.select(*columns)
+
+
+def versioned_coverage_metrics(fact, edp, waters, stores):
+    """Join each fact to its validated catalog snapshot, including historical runs."""
+    products = (
+        edp.select("RUN_ID", "ID_INTERNO")
+        .withColumn("NORMALIZED_BU", F.lit("EDP"))
+        .unionByName(waters.select("RUN_ID", "ID_INTERNO").withColumn("NORMALIZED_BU", F.lit("WATERS")))
+    )
+    product_keys = ["RUN_ID", "ID_INTERNO", "NORMALIZED_BU"]
+    store_keys = ["RUN_ID", "ID_STORE"]
+    n = fact.count()
+    after_product = fact.join(products, product_keys, "left")
+    after_store = after_product.join(stores.select(*store_keys), store_keys, "left")
+    return {
+        "FACT_ROWS": n,
+        "ROWS_AFTER_PRODUCT_JOIN": after_product.count(),
+        "ROWS_AFTER_STORE_JOIN": after_store.count(),
+        "UNMATCHED_PRODUCT_ROWS": fact.join(products, product_keys, "left_anti").count(),
+        "UNMATCHED_STORE_ROWS": fact.join(stores.select(*store_keys), store_keys, "left_anti").count(),
+        "UNKNOWN_BU_ROWS": fact.where(
+            F.col("NORMALIZED_BU").isNull() | ~F.col("NORMALIZED_BU").isin("EDP", "WATERS")
+        ).count(),
+    }
