@@ -1,6 +1,6 @@
--- E-commerce star model. Run in Snowflake, or let the ETL create missing tables.
--- PRD_MDP and MDP_STG must already exist; PIPELINE_RUNS is managed separately.
--- Business keys are validated by the ETL; no unenforced FK is relied upon.
+-- Approved e-commerce contract: products 12, stores 4, fact 5 source columns.
+-- NORMALIZED_BU is derived from unique catalog membership; no source SKU or BU.
+-- PRD_MDP.MDP_STG and the shared PIPELINE_RUNS table must already exist.
 
 CREATE TABLE IF NOT EXISTS PRD_MDP.MDP_STG.CATALOG_EDP (
     ID_INTERNO NUMBER(19,0),
@@ -14,7 +14,6 @@ CREATE TABLE IF NOT EXISTS PRD_MDP.MDP_STG.CATALOG_EDP (
     FABRICANTE VARCHAR,
     FACTOR_CONVERSION DOUBLE,
     SABOR VARCHAR,
-    SKU NUMBER(19,0),
     TAMANO VARCHAR,
     RUN_ID VARCHAR,
     LOGICAL_DATASET VARCHAR,
@@ -43,7 +42,6 @@ CREATE TABLE IF NOT EXISTS PRD_MDP.MDP_STG.CATALOG_WATERS (
     FABRICANTE VARCHAR,
     FACTOR_CONVERSION DOUBLE,
     SABOR VARCHAR,
-    SKU NUMBER(19,0),
     TAMANO VARCHAR,
     RUN_ID VARCHAR,
     LOGICAL_DATASET VARCHAR,
@@ -83,9 +81,8 @@ CREATE TABLE IF NOT EXISTS PRD_MDP.MDP_STG.FACT_ecommerce_danone (
     TIME_ID NUMBER(19,0),
     ID_STORE NUMBER(19,0),
     ID_INTERNO NUMBER(19,0),
-    UNIDADES DOUBLE,
+    UNIDADES NUMBER(19,0),
     MONTO DOUBLE,
-    BU VARCHAR,
     NORMALIZED_BU VARCHAR,
     ANIO NUMBER(10,0),
     MES NUMBER(10,0),

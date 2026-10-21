@@ -30,12 +30,47 @@ def _assert_delta(spark, table):
         raise PipelineError("An existing pipeline table is not a Delta table.", "DELTA_LOAD_ERROR")
 
 
+def _delta_legacy_schema(actual, expected):
+    old = {f.name: f.dataType for f in actual}
+    new = {f.name: f.dataType for f in expected}
+    return (
+        not (set(new) - set(old))
+        and (set(old) - set(new)) <= {"SKU", "BU", "PRODUCT_SKU"}
+        and all(
+            old[name] == kind
+            or (name == "UNIDADES" and isinstance(old[name], T.DoubleType) and isinstance(kind, T.LongType))
+            for name, kind in new.items()
+        )
+    )
+
+
 def ensure_delta_table(spark, table, frame, partitions=None):
-    if not spark.catalog.tableExists(table):
-        writer = frame.limit(0).write.format("delta").mode("errorifexists")
-        if partitions:
-            writer = writer.partitionBy(*partitions)
-        writer.saveAsTable(table)
+    exists = spark.catalog.tableExists(table)
+    mode, migrate = "errorifexists", False
+    if exists:
+        _assert_delta(spark, table)
+        actual = spark.table(table)
+        if {f.name: f.dataType for f in actual.schema} == {f.name: f.dataType for f in frame.schema}:
+            return
+        business = {
+            C.CATALOG_EDP_TABLE,
+            C.CATALOG_WATERS_TABLE,
+            C.CATALOG_STORE_TABLE,
+            C.FACT_STAGING_TABLE,
+            C.FACT_CURATED_TABLE,
+        }
+        if table not in business or not _delta_legacy_schema(actual.schema, frame.schema) or actual.limit(1).count():
+            raise PipelineError(
+                "Delta table schema differs from the approved contract; populated tables require an explicit migration.",
+                "DELTA_LOAD_ERROR",
+            )
+        mode, migrate = "overwrite", True
+    writer = frame.limit(0).write.format("delta").mode(mode)
+    if migrate:
+        writer = writer.option("overwriteSchema", "true")
+    if partitions:
+        writer = writer.partitionBy(*partitions)
+    writer.saveAsTable(table)
     _assert_delta(spark, table)
 
 
@@ -283,7 +318,7 @@ def _snowflake_contract_type_matches(field, actual):
 
 
 def ensure_snowflake_table(cursor, table, frame):
-    """Create a business table if absent; refuse incompatible existing schemas."""
+    """Create/validate a business table; upgrade only known, empty legacy schemas."""
     table = sql_identifier(table)
     database, schema, name = table.split(".")
     ddl = ",".join(f"{sql_identifier(f.name)} {_sql_type(f.dataType)}" for f in frame.schema)
@@ -294,14 +329,38 @@ def ensure_snowflake_table(cursor, table, frame):
         f"WHERE TABLE_SCHEMA='{schema.upper()}' AND TABLE_NAME='{name.upper()}' ORDER BY ORDINAL_POSITION"
     )
     actual = {row[0].upper(): (row[1], row[2], row[3]) for row in cursor.fetchall()}
-    if set(actual) != set(frame.columns) or any(
-        not _snowflake_contract_type_matches(field, actual[field.name]) for field in frame.schema
-    ):
-        raise PipelineError(
-            f"Existing Snowflake table {table} has an incompatible schema. "
-            "Review the star-model DDL; existing tables are never altered or replaced automatically.",
-            "SNOWFLAKE_LOAD_ERROR",
+
+    def compatible():
+        return set(actual) == set(frame.columns) and all(
+            _snowflake_contract_type_matches(field, actual[field.name]) for field in frame.schema
         )
+
+    migrated = False
+    if not compatible():
+        business = set(C.SNOWFLAKE_CATALOG_TABLES.values()) | {C.TARGET_SNOWFLAKE_TABLE}
+        legacy = (
+            not (set(frame.columns) - set(actual))
+            and (set(actual) - set(frame.columns)) <= {"SKU", "BU", "PRODUCT_SKU"}
+            and all(
+                _snowflake_contract_type_matches(field, actual[field.name])
+                or (
+                    field.name == "UNIDADES"
+                    and isinstance(field.dataType, T.LongType)
+                    and actual[field.name][0].upper() in {"FLOAT", "DOUBLE", "REAL"}
+                )
+                for field in frame.schema
+            )
+        )
+        if table in business and legacy and _cursor_count(cursor, table) == 0:
+            # DDL is outside the data transaction. Preserve grants; never replace populated objects.
+            cursor.execute(f"CREATE OR REPLACE TABLE {table} ({ddl}) COPY GRANTS")
+            migrated = True
+        else:
+            raise PipelineError(
+                f"Existing Snowflake table {table} has an incompatible schema. Populated or unknown schemas require an explicit migration.",
+                "SNOWFLAKE_LOAD_ERROR",
+            )
+    return migrated
 
 
 def _cursor_count(cursor, table, predicate="1=1"):
@@ -326,7 +385,7 @@ def _validate_catalog_history(frame, dataset, run_id):
         .count()
     ):
         raise PipelineError("Catalog snapshot keys or validity metadata are missing.", "SNOWFLAKE_LOAD_ERROR")
-    keys = [primary] if dataset == "STORE_CATALOG" else ["ID_INTERNO", "UPC", "ID_IMPORT", "SKU"]
+    keys = [primary] if dataset == "STORE_CATALOG" else ["ID_INTERNO", "UPC", "ID_IMPORT"]
     for key in keys:
         if frame.groupBy("RUN_ID", key).count().where(F.col("count") > 1).limit(1).count():
             raise PipelineError(
@@ -405,13 +464,17 @@ def load_snowflake_period(spark, options, frame, anio, mes, run_id, observed_met
     counts = {dataset: catalog.count() for dataset, catalog in catalog_frames.items()}
     counts["ECOMMERCE_FACT"] = expected["rows"]
     catalog_metrics, cleanup, created = {}, {}, []
+    schema_updates = []
     with snowflake_connection(options) as conn:
         cursor = conn.cursor()
         in_transaction = False
         try:
             # All DDL is outside the explicit transaction. Only DML follows BEGIN.
             for dataset, payload in payloads.items():
-                ensure_snowflake_table(cursor, targets[dataset], payload)
+                if ensure_snowflake_table(cursor, targets[dataset], payload):
+                    schema_updates.append(targets[dataset])
+                    if observed_metrics is not None:
+                        observed_metrics["empty_schema_updates"] = list(schema_updates)
             before = _cursor_metrics(cursor, C.TARGET_SNOWFLAKE_TABLE, predicate)
             if observed_metrics is not None:
                 observed_metrics.update(target_rows_before=before["rows"], target_amount_before=before["amount"])
@@ -507,6 +570,7 @@ def load_snowflake_period(spark, options, frame, anio, mes, run_id, observed_met
         "target_amount": after["amount"],
         "amount_difference": after["amount"] - expected["amount"],
         "reconciliation_status": "PASS",
+        "empty_schema_updates": schema_updates,
         "catalog_metrics": catalog_metrics,
         "star_relationships": relationships,
         "staging_cleanup": cleanup,

@@ -33,7 +33,7 @@ def spark(tmp_path_factory):
 
 @pytest.fixture
 def product_rows():
-    def row(internal=1, upc=11, sku=111, name="Product", description="Description"):
+    def row(internal=1, upc=11, name="Product", description="Description"):
         return (
             internal,
             upc,
@@ -46,7 +46,6 @@ def product_rows():
             "Manufacturer",
             1.0,
             "Flavor",
-            sku,
             "1L",
         )
 
@@ -62,7 +61,7 @@ def catalogs(spark, product_rows):
         for c in C.EDP_EXPECTED_COLUMNS
     )
     edp = spark.createDataFrame([product_rows()], schema)
-    waters = spark.createDataFrame([product_rows(2, 22, 222)], schema)
+    waters = spark.createDataFrame([product_rows(2, 22)], schema)
     stores = spark.createDataFrame(
         [(1, "Online", "Chain", "Digital")], "ID_STORE long, TYPE string, CADENA string, CANAL string"
     )

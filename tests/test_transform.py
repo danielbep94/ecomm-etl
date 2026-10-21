@@ -71,10 +71,10 @@ def test_duplicate_classifications(spark, catalogs, product_rows):
         [
             product_rows(),
             product_rows(),
-            product_rows(2, 22, 222, description="A"),
-            product_rows(2, 22, 222, description="B"),
-            product_rows(3, 33, 333, name="A"),
-            product_rows(3, 33, 333, name="B"),
+            product_rows(2, 22, description="A"),
+            product_rows(2, 22, description="B"),
+            product_rows(3, 33, name="A"),
+            product_rows(3, 33, name="B"),
         ],
         edp.schema,
     )
@@ -203,3 +203,56 @@ def test_annual_detection_and_metadata_preserve_all_twelve_months(spark):
     assert sorted(row.MES for row in annotated.select("MES").collect()) == list(range(1, 13))
     assert metrics["LOAD_SCOPE"] == "YEAR" and metrics["REQUESTED_PERIOD_ROWS"] == 12 and not report.failed
     assert report.dataframe().first().MES is None
+
+
+@pytest.mark.parametrize("dataset", ["EDP_CATALOG", "WATERS_CATALOG", "ECOMMERCE_FACT", "STORE_CATALOG"])
+def test_approved_source_headers_are_exact(spark, dataset):
+    expected = C.SOURCE_DEFINITIONS[dataset][0]
+    report = V.ValidationReport(spark, "schema", 2026, "ALL")
+    assert V.validate_headers(expected, expected, report, dataset, "source.csv") == expected
+    assert not report.failed
+    extra = "BU" if dataset == "ECOMMERCE_FACT" else "SKU"
+    assert V.validate_headers(expected + [extra], expected, report, dataset, "source.csv") is None
+    assert report.failed
+
+
+@pytest.mark.parametrize("units,bad", [("17", False), ("17.5", True), ("-1", False)])
+def test_fact_units_follow_integer_contract(spark, units, bad):
+    raw = spark.createDataFrame(
+        [("202601", "2197", "1", units, "109.42", None)],
+        "TIME_ID string, ID_STORE string, ID_INTERNO string, UNIDADES string, MONTO string, _CSV_ERROR string",
+    )
+    report, cache = V.ValidationReport(spark, "units", 2026, "ALL"), []
+    try:
+        frame, count = V.validate_and_cast_source(raw, "ECOMMERCE_FACT", report, "fact.csv", cache)
+        assert count == 1 and report.failed == bad
+        if not bad:
+            assert frame.schema["UNIDADES"].dataType.simpleString() == "bigint"
+    finally:
+        for frame in cache:
+            frame.unpersist()
+
+
+def test_missing_bu_is_derived_without_dropping_or_multiplying_fact_rows(spark, catalogs):
+    edp, waters, _ = catalogs
+    fact = spark.createDataFrame(
+        [(202601, 1, 1, 1.0, 10.0), (202602, 1, 2, 2.0, 20.0)],
+        "TIME_ID long, ID_STORE long, ID_INTERNO long, UNIDADES double, MONTO double",
+    )
+    report = V.ValidationReport(spark, "bu", 2026, "ALL")
+    result, metrics = V.infer_fact_bu(fact, edp, waters, report)
+    assert {r.ID_INTERNO: r.NORMALIZED_BU for r in result.collect()} == {1: "EDP", 2: "WATERS"}
+    assert result.count() == fact.count() == 2 and not report.failed
+    assert metrics["derived_rows"] == 2
+
+
+def test_missing_bu_rejects_ambiguous_and_unknown_products(spark, catalogs):
+    edp, waters, _ = catalogs
+    fact = spark.createDataFrame(
+        [(202601, 1, 1, 1.0, 10.0), (202602, 1, 99, 2.0, 20.0)],
+        "TIME_ID long, ID_STORE long, ID_INTERNO long, UNIDADES double, MONTO double",
+    )
+    report = V.ValidationReport(spark, "bu", 2026, "ALL")
+    result, metrics = V.infer_fact_bu(fact, edp, waters.unionByName(edp), report)
+    assert result.count() == 2 and all(r.NORMALIZED_BU is None for r in result.collect())
+    assert metrics["ambiguous_rows"] == metrics["unmatched_rows"] == 1 and report.failed

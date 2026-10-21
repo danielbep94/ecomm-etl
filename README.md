@@ -5,6 +5,43 @@ completo, conserva snapshots de catálogos, reemplaza el periodo seleccionado en
 Snowflake, registra el resultado terminal y permite consultar QA sin los archivos
 originales. El código de producción está en los ocho módulos solicitados.
 
+## Contrato fuente aprobado
+
+El loader usa exactamente la estructura validada por el usuario:
+
+| Archivo / dataset | Columnas y tipos |
+| --- | --- |
+| Fact | TIME_ID, ID_STORE, ID_INTERNO, UNIDADES: enteros; MONTO: float. |
+| Catálogo EDP | ID_INTERNO, UPC, ID_IMPORT: enteros; FACTOR_CONVERSION: float; NOMBRE, MARCA, CATEGORIA, DESCRIPCION, EMPAQUE, FABRICANTE, SABOR, TAMANO: texto. |
+| Catálogo Waters | Las mismas doce columnas y tipos del catálogo EDP. |
+| Tiendas | ID_STORE: entero; TYPE, CADENA, CANAL: texto. |
+
+No existen SKU en productos ni BU en la fact fuente. Las cabeceras se validan
+contra estas listas exactas; no se insertan columnas SKU vacías. UNIDADES se
+valida como entero de 64 bits: 17 y 17.0 son válidos; 17.5 falla sin redondearse.
+MONTO y FACTOR_CONVERSION se mantienen como Double. Los identificadores también
+usan LongType / NUMBER(19,0), evitando desbordar códigos UPC.
+
+El usuario confirmó que ID_INTERNO es único entre ambos catálogos y que ID_STORE
+es numérico. El ETL deriva solamente NORMALIZED_BU (EDP o WATERS) según el catálogo
+al que pertenece cada ID_INTERNO; no crea una columna BU en los destinos. Productos
+sin catálogo o presentes en ambos invalidan todo el lote. La clasificación es un
+paso normal del proceso, con conteos en BUSINESS_METRICS_JSON.bu_derivation.
+Las tres claves de producto ID_INTERNO/UPC/ID_IMPORT conservan validación estricta
+de duplicados, y los joins de QA siguen usando RUN_ID + ID.
+
+### Actualizar tablas creadas con versiones anteriores
+
+La versión 3.0 cambia los esquemas de negocio: elimina SKU/PRODUCT_SKU/BU y cambia
+UNIDADES de Double a Long. El ETL reconoce esos esquemas anteriores y solo los
+actualiza automáticamente si la tabla está **vacía**. Delta usa overwriteSchema
+sobre cero filas; Snowflake usa CREATE OR REPLACE con COPY GRANTS después de
+confirmar COUNT(*)=0. Solo aplica a las tablas de negocio configuradas. El tracker
+y el schema Hive no se recrean. Una tabla poblada o un cambio de tipos desconocido
+se rechaza y requiere una migración explícita. Mantén detenidos los otros escritores.
+Estos DDL ocurren antes de la transacción de carga; la atomicidad de datos
+Snowflake sigue cubriendo las cuatro tablas de negocio.
+
 ## Archivo anual: MES=ALL
 
 Un archivo `...FULL_2026.csv` puede incluir los doce meses. Configura los widgets
@@ -42,7 +79,7 @@ que cada RUN_ID tenga tracking SUCCEEDED.
 El job valida primero los cuatro CSV completos: columnas y tipos, claves
 obligatorias, duplicados, periodos, BU, cobertura y conservación de filas en los
 joins. Un error bloquea todas las escrituras de negocio. Los catálogos no aceptan
-duplicados: `ID_INTERNO`, `UPC`, `ID_IMPORT` y `SKU` deben ser únicos dentro de cada
+duplicados: `ID_INTERNO`, `UPC` e `ID_IMPORT` deben ser únicos dentro de cada
 catálogo de productos por snapshot; `ID_STORE` debe ser único en tiendas. Tanto
 copias idénticas como atributos conflictivos hacen fallar el lote; no se eliminan
 duplicados automáticamente ni se permite bajar su severidad a advertencia.
@@ -83,7 +120,7 @@ No depende de los CSV ni ejecuta una nueva carga.
 - Los CSV son UTF-8, separados por coma, con cabecera, comillas dobles y comillas
   escapadas duplicándolas. Cada registro ocupa una línea física; los registros
   multilínea, vacíos, mal entrecomillados o con ancho incorrecto fallan validación.
-- Los identificadores numéricos usan `LongType`, las medidas `DoubleType` y los
+- Los identificadores y UNIDADES usan `LongType`, MONTO y FACTOR_CONVERSION usan `DoubleType` y los
   objetos `StringType`. No hay inferencia de esquema. Se aceptan representaciones
   enteras exactas como `1`, `1.0` y `1e3`, sin redondear identificadores.
 - `TIME_ID` usa **un solo formato por archivo**: `YYYYMM` o `YYYYMMDD`. Se
@@ -103,7 +140,7 @@ No depende de los CSV ni ejecuta una nueva carga.
   falla técnica posterior puede dejar cambios ya confirmados; el reintento del
   periodo los sustituye de forma idempotente.
 - Las sumas monetarias de conciliación usan `DECIMAL/NUMBER(38,6)`, manteniendo
-  las columnas fuente en `DoubleType`. La tolerancia es 0.01. Además se compara
+  MONTO en `DoubleType`. La tolerancia es 0.01. Además se compara
   el multiconjunto completo de registros, incluyendo multiplicidades, para no
   ocultar diferencias con el mismo conteo o total.
 
@@ -178,6 +215,8 @@ schemas ni recursos adicionales.
    SELECT/INSERT/DELETE sobre la fact, SELECT/INSERT/UPDATE sobre los tres
    catálogos, CREATE TABLE para los destinos y las
    tablas transitorias por intento, y SELECT/INSERT sobre el tracker existente.
+   La actualización de tablas Snowflake vacías anteriores requiere OWNERSHIP o
+   permisos equivalentes para CREATE OR REPLACE; COPY GRANTS conserva sus grants.
 
 No se han ejecutado llamadas a tus servicios remotos desde este repositorio.
 Las pruebas locales no certifican permisos, conectores ni datos de producción.
@@ -250,18 +289,17 @@ vacías o duplicadas generan ERROR.
 ### Esquemas fuente
 
 - EDP y Waters, lógicamente separados: `ID_INTERNO, UPC, ID_IMPORT, NOMBRE, MARCA,
-  CATEGORIA, DESCRIPCION, EMPAQUE, FABRICANTE, FACTOR_CONVERSION, SABOR, SKU, TAMANO`.
+  CATEGORIA, DESCRIPCION, EMPAQUE, FABRICANTE, FACTOR_CONVERSION, SABOR, TAMANO`.
   Los identificadores según el mapa son Long; `FACTOR_CONVERSION`
   es Double; las demás columnas son String. En concreto los Long son
-  `ID_INTERNO`, `UPC`, `ID_IMPORT`, `SKU`.
+  `ID_INTERNO`, `UPC`, `ID_IMPORT`.
 - Tiendas: `ID_STORE` (Long), `TYPE`, `CADENA`, `CANAL` (String).
-- Fact anual: `TIME_ID, ID_STORE, ID_INTERNO` (Long), `UNIDADES, MONTO` (Double),
-  `BU` (String).
+- Fact anual: `TIME_ID, ID_STORE, ID_INTERNO, UNIDADES` (Long), `MONTO` (Double).
 
 Se distinguen faltantes de valores numéricos mal formados; se rechazan fracciones
 en IDs, desbordamientos de Long, NaN e infinito. Los IDs son no negativos y el
 factor debe ser positivo. Los valores obligatorios vacíos, `NULL`, `NONE`, `N/A`
-y `NA` fallan. BU se normaliza con el mapa del requerimiento.
+y `NA` fallan. NORMALIZED_BU se deriva por pertenencia a los catálogos de producto.
 
 ## Usar el lote anual 2026 mostrado en Databricks
 
@@ -399,7 +437,7 @@ nulos, intento 0 y trigger `INTERACTIVE`.
    `STORE_*` y metadata operacional. Se conserva el grano de la fact fuente.
 10. Concilia filas, MONTO y registros entre fuente transformada y Delta.
 11. Crea las cuatro tablas Snowflake si faltan y cuatro staging transitorios
-    con sufijo RUN_ID. Proyecta la fact a sus 16 columnas sin descripciones y
+    con sufijo RUN_ID. Proyecta la fact a sus 15 columnas sin descripciones y
     copia la historia completa de catálogos desde Delta. Después de conciliar
     staging, en **una misma conexión Python** ejecuta BEGIN, tres MERGE por
     RUN_ID + ID, DELETE/INSERT del periodo de la fact (ANIO/MES o ANIO con ALL), conciliación de las cuatro
@@ -519,16 +557,16 @@ Las transacciones Snowflake se prueban con un doble de conexión; no ejecutan SQ
 contra la cuenta real. La validación integral de conectores, permisos y servicios
 corresponde a la prueba posterior en tu workspace Databricks.
 
-Los cinco casos de integración con escritura real en Delta son opcionales: configura
+Los siete casos de integración con escritura real en Delta son opcionales: configura
 `ECOMM_TEST_DELTA_JARS` con las rutas de los JARs oficiales de Delta Spark y Delta
 Storage, separadas por coma, e instala el paquete Python `delta-spark` compatible.
-Sin esa variable se omiten explícitamente esos cinco casos. En la validación de
+Sin esa variable se omiten explícitamente esos siete casos. En la validación de
 este desarrollo se ejecutaron con Spark 4.0.4, Delta 4.0.1, Python 3.12 y Java 21;
 los JARs se descargaron de Maven Central y se verificaron sus digests publicados.
 
 ### Validación realizada
 
-La suite completa terminó con **112 pruebas aprobadas, 0 fallos y 0 omitidas**.
+La suite completa terminó con **126 pruebas aprobadas, 0 fallos y 0 omitidas**.
 Las pruebas locales usan Python 3.12, Spark 4.0.4 y Delta Lake 4.0.1 e incluyen
 un lote completo de cuatro CSV con cargas Delta y movimientos locales de archivos
 reales. La suite también comprueba creación de las cuatro tablas, rechazo de
@@ -536,5 +574,5 @@ esquemas incompatibles, rollback de cambios en catálogos/fact, joins histórico
 sin multiplicación y los dos notebooks. Snowflake se ejercita con dobles de
 conexión; la ejecución integral en tu Databricks/Snowflake está pendiente.
 
-Además se aprobaron tres escenarios QA adicionales: un mes, un año con distintas
+La suite incluye tres escenarios QA: un mes, un año con distintas
 versiones de catálogo por mes y la detección de un RUN_ID sin tracking exitoso.

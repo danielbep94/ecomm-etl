@@ -57,10 +57,10 @@ def star_payloads(spark, catalogs):
         "FILE_YEAR": 2025,
     }
     source = spark.createDataFrame(
-        [(202507, 1, 1, 1.0, 10.0, "EDP"), (202507, 1, 2, 1.0, -2.5, "WATERS")],
-        "TIME_ID long, ID_STORE long, ID_INTERNO long, UNIDADES double, MONTO double, BU string",
+        [(202507, 1, 1, 1, 10.0, "EDP"), (202507, 1, 2, 1, -2.5, "WATERS")],
+        "TIME_ID long, ID_STORE long, ID_INTERNO long, UNIDADES long, MONTO double, BU string",
     )
-    fact = V.add_operational_metadata(V.normalize_bu(source), metadata, 2025, 7, timestamp=utc_now())
+    fact = V.star_fact(V.add_operational_metadata(V.normalize_bu(source), metadata, 2025, 7, timestamp=utc_now()))
     dimensions = {}
     for dataset, frame in zip(C.SNOWFLAKE_CATALOG_TABLES, catalogs):
         current = V.add_operational_metadata(
@@ -237,7 +237,7 @@ def test_historical_star_joins_and_fact_projection(star_payloads):
     fact, catalogs, _ = star_payloads
     fact = fact.withColumn("RUN_ID", F.lit("older-run"))
     projected = V.star_fact(fact.withColumn("PRODUCT_NOMBRE", F.lit("description")))
-    assert len(projected.columns) == 16 and "PRODUCT_NOMBRE" not in projected.columns
+    assert len(projected.columns) == 15 and "PRODUCT_NOMBRE" not in projected.columns
     metrics = V.versioned_coverage_metrics(projected, *catalogs.values())
     assert metrics["FACT_ROWS"] == metrics["ROWS_AFTER_PRODUCT_JOIN"] == metrics["ROWS_AFTER_STORE_JOIN"] == 2
     assert metrics["UNMATCHED_PRODUCT_ROWS"] == metrics["UNMATCHED_STORE_ROWS"] == 0
@@ -411,5 +411,48 @@ def test_real_delta_annual_replacement_preserves_other_year(spark, monthly):
         L.load_monthly_delta(spark, table, monthly, 2025, "ALL")
         assert spark.table(table).where("ANIO=2025 AND MES=8").count() == 0
         assert spark.table(table).where("ANIO=2024").count() == 2
+    finally:
+        spark.sql(f"DROP TABLE IF EXISTS {table}")
+
+
+def test_known_legacy_empty_snowflake_schema_is_updated(star_payloads):
+    fact, _, _ = star_payloads
+    legacy = fact.withColumn("BU", F.lit("EDP")).withColumn("UNIDADES", F.col("UNIDADES").cast("double"))
+
+    class EmptyLegacyCursor(Cursor):
+        def execute(self, sql):
+            super().execute(sql)
+            if sql.startswith("SELECT COUNT(*) FROM"):
+                self.result = (0,)
+            if sql.startswith("CREATE OR REPLACE TABLE"):
+                self.payloads[C.TARGET_SNOWFLAKE_TABLE] = fact
+            return self
+
+    cursor = EmptyLegacyCursor({C.TARGET_SNOWFLAKE_TABLE: legacy})
+    assert L.ensure_snowflake_table(cursor, C.TARGET_SNOWFLAKE_TABLE, fact)
+    assert any(sql.startswith("CREATE OR REPLACE TABLE") and sql.endswith("COPY GRANTS") for sql in cursor.commands)
+    populated = Cursor({C.TARGET_SNOWFLAKE_TABLE: legacy})
+    with pytest.raises(PipelineError, match="explicit migration"):
+        L.ensure_snowflake_table(populated, C.TARGET_SNOWFLAKE_TABLE, fact)
+    assert not any(sql.startswith("CREATE OR REPLACE") for sql in populated.commands)
+
+
+@pytest.mark.skipif(not os.environ.get("ECOMM_TEST_DELTA_JARS"), reason="Optional local Delta JARs not configured")
+@pytest.mark.parametrize("populated", [False, True])
+def test_delta_legacy_schema_upgrade_requires_empty_table(spark, monkeypatch, populated):
+    table = "default.schema_" + uuid.uuid4().hex
+    monkeypatch.setattr(C, "FACT_CURATED_TABLE", table)
+    expected = spark.createDataFrame([(2026, 1, 17)], "ANIO int, MES int, UNIDADES long")
+    legacy = expected.withColumn("UNIDADES", F.col("UNIDADES").cast("double")).withColumn("BU", F.lit("EDP"))
+    try:
+        (legacy if populated else legacy.limit(0)).write.format("delta").saveAsTable(table)
+        if populated:
+            with pytest.raises(PipelineError, match="explicit migration"):
+                L.ensure_delta_table(spark, table, expected)
+            assert spark.table(table).count() == 1 and "BU" in spark.table(table).columns
+        else:
+            L.ensure_delta_table(spark, table, expected)
+            assert "BU" not in spark.table(table).columns
+            assert spark.table(table).schema["UNIDADES"].dataType.simpleString() == "bigint"
     finally:
         spark.sql(f"DROP TABLE IF EXISTS {table}")

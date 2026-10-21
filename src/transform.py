@@ -315,7 +315,7 @@ def validate_and_cast_source(raw, dataset, report, source, cache_frames):
     typed = working.select(*converted).cache()
     cache_frames.append(typed)
     for column in numeric_columns:
-        if types[column] == "int64":
+        if types[column] == "int64" and column != "UNIDADES":
             n = typed.where(F.col(column) < 0).count()
             report.add(dataset, "NONNEGATIVE_" + column, n, column=column, source=source)
     if "FACTOR_CONVERSION" in columns:
@@ -359,11 +359,7 @@ def duplicate_groups(frame, keys, all_columns, comparison_columns=None):
 
 def validate_catalog_duplicates(frame, dataset, report, source=None):
     columns = C.SOURCE_DEFINITIONS[dataset][0]
-    key_sets = (
-        [["ID_STORE"]]
-        if dataset == "STORE_CATALOG"
-        else [["ID_INTERNO"], ["UPC"], ["ID_IMPORT"], ["SKU"], ["ID_INTERNO", "SKU"]]
-    )
+    key_sets = [["ID_STORE"]] if dataset == "STORE_CATALOG" else [["ID_INTERNO"], ["UPC"], ["ID_IMPORT"]]
     primary_count = 0
     for keys in key_sets:
         detail = duplicate_groups(
@@ -419,7 +415,7 @@ def cross_catalog_collisions(edp, waters, key):
 
 def validate_cross_catalogs(edp, waters, report):
     total = 0
-    for key in ["ID_INTERNO", "UPC", "ID_IMPORT", "SKU"]:
+    for key in ["ID_INTERNO", "UPC", "ID_IMPORT"]:
         detail = cross_catalog_collisions(edp, waters, key)
         count = detail.count()
         total += count
@@ -445,6 +441,10 @@ def validate_cross_catalogs(edp, waters, report):
 
 
 def normalize_bu(frame):
+    if "BU" not in frame.columns:
+        return (
+            frame if "NORMALIZED_BU" in frame.columns else frame.withColumn("NORMALIZED_BU", F.lit(None).cast("string"))
+        )
     mapping = F.create_map(*[F.lit(v) for pair in C.BU_NORMALIZATION.items() for v in pair])
     return frame.withColumn("NORMALIZED_BU", mapping[F.upper(F.trim(F.col("BU")))])
 
@@ -489,7 +489,7 @@ def detect_fact_period(frame, anio, mes, report, source=None):
         unknown,
         category="REFERENTIAL",
         source=source,
-        sample=_sample(dated.where(F.col("NORMALIZED_BU").isNull()), ["BU"]) if unknown else None,
+        sample=_sample(dated.where(F.col("NORMALIZED_BU").isNull()), ["ID_INTERNO"]) if unknown else None,
     )
     monthly = period_filter(dated, anio, mes).drop("_TIME_TEXT", "_TIME_ISO", "_TIME_DATE")
     count = monthly.count()
@@ -723,11 +723,11 @@ def apply_qa_filters(frame, run_id=None, logical_dataset=None, bu=None, id_inter
 def qa_catalog_duplicate_detail(edp, waters, stores):
     frames = []
     for dataset, frame, keys in [
-        ("EDP_CATALOG", edp, ["ID_INTERNO", "UPC", "ID_IMPORT", "SKU"]),
-        ("WATERS_CATALOG", waters, ["ID_INTERNO", "UPC", "ID_IMPORT", "SKU"]),
+        ("EDP_CATALOG", edp, ["ID_INTERNO", "UPC", "ID_IMPORT"]),
+        ("WATERS_CATALOG", waters, ["ID_INTERNO", "UPC", "ID_IMPORT"]),
         ("STORE_CATALOG", stores, ["ID_STORE"]),
     ]:
-        key_sets = [[k] for k in keys] + ([["ID_INTERNO", "SKU"]] if dataset != "STORE_CATALOG" else [])
+        key_sets = [[k] for k in keys]
         for key_set in key_sets:
             key_set = (["RUN_ID"] if "RUN_ID" in frame.columns else []) + key_set
             grouped = duplicate_groups(frame, key_set, C.SOURCE_DEFINITIONS[dataset][0])
@@ -750,7 +750,7 @@ def qa_cross_catalog_collisions(edp, waters):
             cross_catalog_collisions(edp, waters, key).select(
                 F.lit(key).alias("KEY_COLUMN"), F.col(key).cast("string").alias("KEY_VALUE"), "CLASSIFICATION", "N"
             )
-            for key in ["ID_INTERNO", "UPC", "ID_IMPORT", "SKU"]
+            for key in ["ID_INTERNO", "UPC", "ID_IMPORT"]
         ],
     )
 
@@ -815,3 +815,44 @@ def join_star_fact(fact, edp, waters, stores):
         .join(store_rows, ["RUN_ID", "ID_STORE"], "left")
         .fillna(False, subset=["PRODUCT_MATCHED", "STORE_MATCHED"])
     )
+
+
+def infer_fact_bu(frame, edp, waters, report, source=None):
+    """Classify the five-column fact by catalog membership, without expanding facts."""
+    memberships = (
+        edp.select("ID_INTERNO")
+        .withColumn("_CATALOG_BU", F.lit("EDP"))
+        .unionByName(waters.select("ID_INTERNO").withColumn("_CATALOG_BU", F.lit("WATERS")))
+    )
+    lookup = memberships.groupBy("ID_INTERNO").agg(
+        F.countDistinct("_CATALOG_BU").alias("_BU_COUNT"), F.min("_CATALOG_BU").alias("_INFERRED_BU")
+    )
+    joined = frame.drop("BU").join(lookup, "ID_INTERNO", "left")
+    unmatched = joined.where(F.col("_BU_COUNT").isNull()).count()
+    ambiguous = joined.where(F.col("_BU_COUNT") > 1).count()
+    derived = joined.where(F.col("_BU_COUNT") == 1).count()
+    report.add(
+        "ECOMMERCE_FACT",
+        "BU_DERIVATION_PRODUCT_EXISTS",
+        unmatched,
+        category="REFERENTIAL",
+        source=source,
+        sample=_sample(joined.where(F.col("_BU_COUNT").isNull()), ["ID_INTERNO"]) if unmatched else None,
+    )
+    report.add(
+        "ECOMMERCE_FACT",
+        "BU_DERIVATION_UNAMBIGUOUS",
+        ambiguous,
+        category="REFERENTIAL",
+        source=source,
+        sample=_sample(joined.where(F.col("_BU_COUNT") > 1), ["ID_INTERNO"]) if ambiguous else None,
+    )
+    result = joined.withColumn("NORMALIZED_BU", F.when(F.col("_BU_COUNT") == 1, F.col("_INFERRED_BU"))).drop(
+        "_BU_COUNT", "_INFERRED_BU"
+    )
+    return result.select(*C.FACT_EXPECTED_COLUMNS, "NORMALIZED_BU"), {
+        "method": "ID_INTERNO_CATALOG_MEMBERSHIP",
+        "derived_rows": derived,
+        "unmatched_rows": unmatched,
+        "ambiguous_rows": ambiguous,
+    }

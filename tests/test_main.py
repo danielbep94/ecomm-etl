@@ -68,6 +68,7 @@ def pipeline(monkeypatch):
     )
     monkeypatch.setattr(M.V, "validate_catalog_duplicates", lambda *args: 0)
     monkeypatch.setattr(M.V, "validate_cross_catalogs", lambda *args: 0)
+    monkeypatch.setattr(M.V, "infer_fact_bu", lambda frame, *args: (frame, {"derived_rows": 2}))
     monkeypatch.setattr(
         M.V, "detect_fact_period", lambda *args: (Frame(), {"REQUESTED_PERIOD_ROWS": 2, "UNKNOWN_BU_ROWS": 0})
     )
@@ -192,10 +193,10 @@ def test_qa_uses_persisted_snapshots_without_incoming(spark, catalogs, monkeypat
         "FILE_YEAR": 2025,
     }
     source = spark.createDataFrame(
-        [(202507, 1, 1, 1.0, 10.0, "EDP")],
-        "TIME_ID long, ID_STORE long, ID_INTERNO long, UNIDADES double, MONTO double, BU string",
+        [(202507, 1, 1, 1, 10.0, "EDP")],
+        "TIME_ID long, ID_STORE long, ID_INTERNO long, UNIDADES long, MONTO double, BU string",
     )
-    source = V.add_operational_metadata(V.normalize_bu(source), metadata, 2025, 7, timestamp=utc_now())
+    source = V.star_fact(V.add_operational_metadata(V.normalize_bu(source), metadata, 2025, 7, timestamp=utc_now()))
     from pyspark.sql import functions as F
 
     second_id = "22222222-2222-2222-2222-222222222222"
@@ -308,15 +309,16 @@ def test_complete_csv_batch_real_delta_and_file_movement(spark, catalogs, tmp_pa
 
     edp, waters, stores = catalogs
     for dataset, frame in [("EDP_CATALOG", edp), ("WATERS_CATALOG", waters), ("STORE_CATALOG", stores)]:
+        columns = C.SOURCE_DEFINITIONS[dataset][0]
         write_csv(
             C.EXPECTED_STATIC_FILES[dataset]["expected_file_name"],
-            C.SOURCE_DEFINITIONS[dataset][0],
-            [tuple(row[c] for c in C.SOURCE_DEFINITIONS[dataset][0]) for row in frame.collect()],
+            columns,
+            [tuple(row[c] for c in columns) for row in frame.collect()],
         )
     write_csv(
         C.FACT_FILE_TEMPLATE.format(ANIO=2025),
         C.FACT_EXPECTED_COLUMNS,
-        [(202507, 1, 1, 2.0, 20.0, "edp"), (202508, 1, 2, 1.0, 10.0, "PET")],
+        [(202507, 1, 1, 2, 20.0), (202508, 1, 2, 1, 10.0)],
     )
 
     class LocalFS:
@@ -395,6 +397,11 @@ def test_complete_csv_batch_real_delta_and_file_movement(spark, catalogs, tmp_pa
             assert str(record["PERIOD_END_DATE"]) == "2025-12-31"
             assert spark.table(C.CATALOG_EDP_TABLE).first().MES is None
         assert result[0].PRODUCT_MARCA == "Brand" and result[0].STORE_CADENA == "Chain"
+        assert "SKU" not in spark.table(C.CATALOG_EDP_TABLE).columns
+        assert "BU" not in spark.table(C.FACT_CURATED_TABLE).columns
+        assert {row.NORMALIZED_BU for row in result} == ({"EDP", "WATERS"} if scope == "ALL" else {"EDP"})
+        metrics = __import__("json").loads(record["BUSINESS_METRICS_JSON"])
+        assert metrics["bu_derivation"]["derived_rows"] == 2
         assert spark.table(C.VALIDATION_RESULTS_TABLE).where(F.col("VALIDATION_STATUS") == "FAIL").count() == 0
         assert list(incoming.iterdir()) == [] and len(list(current.iterdir())) == 4
         tracking.assert_called_once()

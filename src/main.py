@@ -274,6 +274,23 @@ def run_pipeline(anio, mes, force_reprocess=False, *, spark=None, dbutils=None):
             business_metrics["catalog_metrics"]["cross_catalog_collisions"] = V.validate_cross_catalogs(
                 typed["EDP_CATALOG"], typed["WATERS_CATALOG"], report
             )
+        if "ECOMMERCE_FACT" in typed:
+            catalogs_available = {"EDP_CATALOG", "WATERS_CATALOG"} <= typed.keys()
+            report.add(
+                "ECOMMERCE_FACT",
+                "BU_DERIVATION_CATALOGS_AVAILABLE",
+                int(not catalogs_available),
+                category="REFERENTIAL",
+                source=by_dataset["ECOMMERCE_FACT"][0]["ORIGINAL_FILE_NAME"],
+            )
+            if catalogs_available:
+                typed["ECOMMERCE_FACT"], business_metrics["bu_derivation"] = V.infer_fact_bu(
+                    typed["ECOMMERCE_FACT"],
+                    typed["EDP_CATALOG"],
+                    typed["WATERS_CATALOG"],
+                    report,
+                    by_dataset["ECOMMERCE_FACT"][0]["ORIGINAL_FILE_NAME"],
+                )
         monthly = transformed = None
         if "ECOMMERCE_FACT" in typed:
             fact_file = by_dataset["ECOMMERCE_FACT"][0]
@@ -552,7 +569,9 @@ def run_qa_validation(
     collisions = V.qa_cross_catalog_collisions(edp, waters)
     coverage = V.versioned_coverage_metrics(source, edp, waters, stores)
     period_report = V.ValidationReport(spark, effective_run_id or "QA", anio, mes)
-    _, detection = V.detect_fact_period(source.select(*C.FACT_EXPECTED_COLUMNS), anio, mes, period_report)
+    _, detection = V.detect_fact_period(
+        source.select(*C.FACT_EXPECTED_COLUMNS, "NORMALIZED_BU"), anio, mes, period_report
+    )
     fact_duplicates = V.duplicate_groups(
         source,
         ["TIME_ID", "ID_STORE", "ID_INTERNO", "NORMALIZED_BU"],

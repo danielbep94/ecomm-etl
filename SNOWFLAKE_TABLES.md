@@ -13,24 +13,24 @@ Todas pertenecen a `PRD_MDP.MDP_STG`:
 
 | Tabla | Columnas | Grano y clave de join |
 | --- | --- | --- |
-| `CATALOG_EDP` | 26 | Un producto EDP por snapshot: `RUN_ID, ID_INTERNO`. |
-| `CATALOG_WATERS` | 26 | Un producto Waters por snapshot: `RUN_ID, ID_INTERNO`. |
+| `CATALOG_EDP` | 25 | Un producto EDP por snapshot: `RUN_ID, ID_INTERNO`. |
+| `CATALOG_WATERS` | 25 | Un producto Waters por snapshot: `RUN_ID, ID_INTERNO`. |
 | `CATALOG_STORE` | 16 | Una tienda por snapshot: `RUN_ID, ID_STORE`. |
-| `FACT_ECOMMERCE_DANONE` | 16 | Registro fuente de ventas, sin agregación; referencia ambos catálogos por `RUN_ID` y sus IDs. |
+| `FACT_ECOMMERCE_DANONE` | 15 | Registro fuente de ventas, sin agregación; referencia ambos catálogos por `RUN_ID` y sus IDs. |
 
 Los catálogos conservan todas las columnas de sus CSV. Productos tiene:
 `ID_INTERNO, UPC, ID_IMPORT, NOMBRE, MARCA, CATEGORIA, DESCRIPCION, EMPAQUE,
-FABRICANTE, FACTOR_CONVERSION, SABOR, SKU, TAMANO`. Tiendas tiene:
+FABRICANTE, FACTOR_CONVERSION, SABOR, TAMANO`. Tiendas tiene:
 `ID_STORE, TYPE, CADENA, CANAL`.
 
-La fact conserva sus seis columnas fuente: `TIME_ID, ID_STORE, ID_INTERNO,
-UNIDADES, MONTO, BU`; añade `NORMALIZED_BU, ANIO, MES` y siete columnas de
+La fact conserva sus cinco columnas fuente: `TIME_ID, ID_STORE, ID_INTERNO,
+UNIDADES, MONTO`; añade `NORMALIZED_BU, ANIO, MES` y siete columnas de
 trazabilidad: `RUN_ID, LOGICAL_DATASET, SOURCE_FILE_NAME, SOURCE_FILE_PATH,
 SOURCE_FILE_FINGERPRINT, SOURCE_FILE_YEAR, LOAD_TIMESTAMP_UTC`.
 
 Los catálogos añaden esas mismas siete columnas, ANIO/MES del lote, `CATALOG_BU`
 (solo productos) y `IS_ACTIVE, VALID_FROM_UTC, VALID_TO_UTC`. Los IDs son
-`NUMBER(19,0)`, los periodos/años `NUMBER(10,0)`, las medidas `DOUBLE`, los textos
+`NUMBER(19,0)`, los periodos/años `NUMBER(10,0)`, UNIDADES `NUMBER(19,0)`, MONTO/FACTOR_CONVERSION `DOUBLE`, los textos
 `VARCHAR`, la bandera `BOOLEAN` y los timestamps operacionales `TIMESTAMP_NTZ`
 con valores UTC. `TIME_ID` mantiene YYYYMM o YYYYMMDD.
 
@@ -60,8 +60,8 @@ WHERE f.ANIO = 2026 AND f.MES = 1;
 Elige MES según tu archivo. El join usa **RUN_ID + ID**, porque un mismo producto
 o tienda puede cambiar entre cargas. No filtres `IS_ACTIVE=true` en joins de
 ventas históricas: su snapshot puede estar inactivo y seguir siendo el correcto.
-`NORMALIZED_BU` selecciona el catálogo de productos; WATER/PET/BEC/PET_BEC se
-normalizan a WATERS. La cobertura y la ausencia de multiplicación se validan en
+`NORMALIZED_BU` se deriva según la pertenencia única de ID_INTERNO a EDP o Waters;
+no se requiere BU en el archivo fuente. La cobertura y la ausencia de multiplicación se validan en
 el ETL y en QA. Las restricciones PK/FK de Snowflake estándar no se presuponen
 como controles de integridad; el DDL no las declara.
 
@@ -80,8 +80,11 @@ Database, schema y warehouse deben existir. El rol necesita USAGE sobre ellos,
 CREATE TABLE en el schema, SELECT/INSERT/UPDATE sobre catálogos,
 SELECT/INSERT/DELETE sobre fact y permisos para crear/cargar/leer/eliminar staging.
 El código valida el esquema existente y rechaza contratos incompatibles antes
-del DML; no altera ni reemplaza tablas existentes automáticamente. Una fact
-antigua enriquecida requiere una migración revisada antes de usar esta versión.
+del DML. Solo actualiza automáticamente tablas vacías con el esquema anterior
+reconocido (SKU/BU/PRODUCT_SKU adicionales o UNIDADES Double): verifica COUNT(*)=0
+antes de CREATE OR REPLACE con COPY GRANTS. El rol necesita OWNERSHIP o equivalente
+para ese cambio. Tablas pobladas o esquemas desconocidos requieren una migración
+explícita; sus datos no se borran automáticamente.
 
 Delta, Snowflake y DBFS tienen commits independientes. No existe una transacción
 distribuida; un fallo posterior al COMMIT requiere el reproceso documentado en
@@ -176,3 +179,17 @@ para una carga anual. El tracker registra los límites del año. Los controles d
 reproceso consultan periodos solapados para proteger tanto cargas mensuales como
 anuales ya exitosas. QA anual une catálogos por RUN_ID, incluso si cada mes se
 cargó en un intento diferente.
+
+## Esquema aprobado, versión 3.0
+
+Los productos tienen doce columnas fuente sin SKU, la fact cinco sin BU y las
+tiendas cuatro con ID_STORE entero. UNIDADES se almacena como NUMBER(19,0), MONTO
+y FACTOR_CONVERSION como DOUBLE. No se crean columnas SKU, PRODUCT_SKU o BU en el
+modelo nuevo. NORMALIZED_BU es una columna operativa derivada desde el catálogo
+de cada producto y selecciona EDP o Waters en el join. El usuario confirmó que los
+ID_INTERNO son únicos entre ambos catálogos. Si no se cumple, la carga falla antes
+de modificar tablas de negocio, sin elegir arbitrariamente un catálogo.
+
+Las tablas vacías creadas con el contrato anterior se pueden actualizar por el
+loader; las que contienen filas requieren migración explícita. PIPELINE_RUNS
+mantiene intacto su contrato y su escritura append-only.
