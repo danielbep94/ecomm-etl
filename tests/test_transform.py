@@ -29,6 +29,82 @@ def test_numeric_validation(value, kind, status):
     assert V.parse_numeric(value, kind)[1] == status
 
 
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (None, None),
+        ("  DANY   Fresa 125g  ", "DANY Fresa 125g"),
+        ("\ufeffCafe\u0301\u00a0Danone\u200b", "Café Danone"),
+        ("Brand\x00\tStore\x7f", "Brand Store"),
+        (" L'eau / PET-BEC, 1L ", "L'eau / PET-BEC, 1L"),
+        ("\u2060\u00a0", ""),
+    ],
+)
+def test_source_sanitization_preserves_content_and_is_idempotent(raw, expected):
+    assert V.sanitize_source_value(raw) == expected
+    assert V.sanitize_source_value(expected) == expected
+
+
+def test_sanitization_does_not_repair_invalid_numbers_or_missing_keys():
+    assert V._parse_source_value("1\t2", "int64", False)[1] == "INVALID"
+    assert V._parse_source_value("$12.5", "float64", True)[1] == "INVALID"
+    assert V._parse_source_value(" - ", "int64", False)[1] == "INVALID"
+    assert V._parse_source_value("\ufeff2197\u200b", "int64", False) == ("2197", "VALID", True)
+    assert V._parse_source_value(" - ", "float64", True) == (None, "MISSING", True)
+
+
+def test_sanitized_store_values_are_logged_and_duplicate_checks_use_clean_keys(spark):
+    import json
+
+    raw = spark.createDataFrame(
+        [
+            (" 2197\u200b ", "\ufeffOnline\u00a0 \t Store ", "Cafe\u0301\x00Danone", " Pure\u200b Players ", None),
+            ("2197", "Online Store", "Café Danone", "Pure Players", None),
+        ],
+        "ID_STORE string, TYPE string, CADENA string, CANAL string, _CSV_ERROR string",
+    )
+    report, cache = V.ValidationReport(spark, "sanitized", 2026, "ALL"), []
+    try:
+        frame, count = V.validate_and_cast_source(raw, "STORE_CATALOG", report, "stores.csv", cache)
+        assert count == 2 and not report.failed
+        rows = frame.collect()
+        assert all(
+            r.asDict() == {"ID_STORE": 2197, "TYPE": "Online Store", "CADENA": "Café Danone", "CANAL": "Pure Players"}
+            for r in rows
+        )
+        assert frame.columns == C.STORE_EXPECTED_COLUMNS
+        warning = next(r for r in report.records if r["VALIDATION_RULE"] == "SANITIZED_CADENA")
+        assert warning["VALIDATION_STATUS"] == "WARNING" and warning["AFFECTED_ROWS"] == 1
+        sample = json.loads(warning["SAMPLE_RECORDS_JSON"])[0]
+        assert sample["ID_STORE"] == " 2197\u200b " and sample["SANITIZED_VALUE"] == "Café Danone"
+        assert V.validate_catalog_duplicates(frame, "STORE_CATALOG", report, "stores.csv") == 1
+        assert report.failed and frame.count() == 2
+    finally:
+        for item in cache:
+            item.unpersist()
+
+
+def test_sanitized_empty_mandatory_text_and_encoding_damage_are_rejected(spark):
+    raw = spark.createDataFrame(
+        [
+            ("1", "\ufeff\u00a0\t", "Chain", "Digital", None),
+            ("2", "On\ufffdline", "Chain", "Digital", None),
+        ],
+        "ID_STORE string, TYPE string, CADENA string, CANAL string, _CSV_ERROR string",
+    )
+    report, cache = V.ValidationReport(spark, "bad-text", 2026, "ALL"), []
+    try:
+        frame, count = V.validate_and_cast_source(raw, "STORE_CATALOG", report, "stores.csv", cache)
+        assert frame is None and count == 2 and report.failed
+        failures = {
+            r["VALIDATION_RULE"]: r["AFFECTED_ROWS"] for r in report.records if r["VALIDATION_STATUS"] == "FAIL"
+        }
+        assert failures == {"MANDATORY_TYPE": 1, "TYPE_TYPE": 1}
+    finally:
+        for item in cache:
+            item.unpersist()
+
+
 @pytest.mark.parametrize("args", [(True, 1, False), (25, 1, False), (2025, 13, False), (2025, 1, "yes")])
 def test_bad_parameters(args):
     with pytest.raises(V.ValidationError):
@@ -255,7 +331,11 @@ def test_nullable_measures_preserve_rows_and_identify_raw_placeholders_in_logs(s
         assert rows[0].UNIDADES is None and rows[0].MONTO is None
         assert rows[1].UNIDADES is None and rows[1].MONTO is None
         assert rows[2].UNIDADES == 17.5 and rows[2].MONTO == 109.42
-        warnings = [r for r in report.records if r["VALIDATION_STATUS"] == "WARNING"]
+        warnings = [
+            r
+            for r in report.records
+            if r["VALIDATION_RULE"].startswith("NULLABLE_") and r["VALIDATION_STATUS"] == "WARNING"
+        ]
         assert {r["VALIDATION_RULE"]: r["AFFECTED_ROWS"] for r in warnings} == {
             "NULLABLE_UNIDADES": 2,
             "NULLABLE_MONTO": 2,
@@ -292,7 +372,11 @@ def test_nullable_conversion_factor_warns_and_invalid_factors_identify_products(
         frame, count = V.validate_and_cast_source(raw, "WATERS_CATALOG", report, "waters.csv", cache)
         assert count == 5 and report.failed
         assert frame.where("FACTOR_CONVERSION IS NULL").count() == 2
-        warnings = [r for r in report.records if r["VALIDATION_STATUS"] == "WARNING"]
+        warnings = [
+            r
+            for r in report.records
+            if r["VALIDATION_RULE"].startswith("NULLABLE_") and r["VALIDATION_STATUS"] == "WARNING"
+        ]
         assert len(warnings) == 1 and warnings[0]["VALIDATION_RULE"] == "NULLABLE_FACTOR_CONVERSION"
         assert warnings[0]["AFFECTED_ROWS"] == 2
         errors = [r for r in report.records if r["VALIDATION_STATUS"] == "FAIL"]

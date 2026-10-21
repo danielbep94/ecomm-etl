@@ -308,6 +308,8 @@ def test_complete_csv_batch_real_delta_and_file_movement(spark, catalogs, tmp_pa
             writer.writerows(rows)
 
     edp, waters, stores = catalogs
+    edp = edp.withColumn("NOMBRE", F.lit("\ufeff Cafe\u0301\u00a0  Danone\u200b "))
+    stores = stores.withColumn("CADENA", F.lit("\u00a0Chain\x00 Online "))
     waters = waters.withColumn("FACTOR_CONVERSION", F.lit(None).cast("double"))
     for dataset, frame in [("EDP_CATALOG", edp), ("WATERS_CATALOG", waters), ("STORE_CATALOG", stores)]:
         columns = C.SOURCE_DEFINITIONS[dataset][0]
@@ -398,7 +400,9 @@ def test_complete_csv_batch_real_delta_and_file_movement(spark, catalogs, tmp_pa
             assert str(record["PERIOD_START_DATE"]) == "2025-01-01"
             assert str(record["PERIOD_END_DATE"]) == "2025-12-31"
             assert spark.table(C.CATALOG_EDP_TABLE).first().MES is None
-        assert result[0].PRODUCT_MARCA == "Brand" and result[0].STORE_CADENA == "Chain"
+        assert result[0].PRODUCT_MARCA == "Brand" and result[0].STORE_CADENA == "Chain Online"
+        assert result[0].PRODUCT_NOMBRE == "Café Danone"
+        assert spark.table(C.CATALOG_EDP_TABLE).first().NOMBRE == "Café Danone"
         assert "SKU" not in spark.table(C.CATALOG_EDP_TABLE).columns
         assert "BU" not in spark.table(C.FACT_CURATED_TABLE).columns
         assert spark.table(C.CATALOG_WATERS_TABLE).first().FACTOR_CONVERSION is None

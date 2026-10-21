@@ -180,7 +180,7 @@ reproceso consultan periodos solapados para proteger tanto cargas mensuales como
 anuales ya exitosas. QA anual une catálogos por RUN_ID, incluso si cada mes se
 cargó en un intento diferente.
 
-## Esquema aprobado, versión 3.1
+## Esquema aprobado, versión 3.2
 
 Los productos tienen doce columnas fuente sin SKU, la fact cinco sin BU y las
 tiendas cuatro con ID_STORE entero. UNIDADES, MONTO y FACTOR_CONVERSION se almacenan
@@ -196,3 +196,20 @@ de modificar tablas de negocio, sin elegir arbitrariamente un catálogo.
 Las tablas vacías creadas con el contrato anterior se pueden actualizar por el
 loader; las que contienen filas requieren migración explícita. PIPELINE_RUNS
 mantiene intacto su contrato y su escritura append-only.
+
+La limpieza de texto ocurre antes de la validación y de los joins. Normaliza
+Unicode/espacios y elimina BOM/zero-width markers; preserva acentos, mayúsculas
+y puntuación. Los logs SANITIZED_* incluyen claves, valores originales y
+SANITIZED_VALUE. Los mismos valores limpios se escriben en Delta y Snowflake.
+
+## Reset explícito de las tablas de prueba
+
+`notebooks/reset_ecommerce_test_tables.py` reinicia estas cuatro tablas y las cinco
+tablas Delta de negocio con el esquema actual, comprueba cero filas y preserva
+PIPELINE_RUNS, los hallazgos de validación y los CSV. El usuario confirmó que los
+destinos configurados son tablas de prueba. El reset descarta todas sus ventas y
+snapshots, y queda fuera del ETL habitual. Detén todos los escritores antes de
+ejecutarlo. Snowflake recrea cada tabla con COPY GRANTS; requiere OWNERSHIP o
+equivalente. No es una transacción entre sistemas. Después de un fallo revisa
+TABLE_NAME/COMPLETED_TABLES y repite el reset. Después de completarlo, sube los
+cuatro CSV y usa FORCE_REPROCESS=true para repetir un periodo con historial previo.

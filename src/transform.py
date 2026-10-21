@@ -4,6 +4,7 @@ import calendar
 import datetime as dt
 import math
 import re
+import unicodedata
 from decimal import Decimal, InvalidOperation
 from functools import reduce
 
@@ -239,6 +240,28 @@ def parse_numeric(value, kind, *, allow_dash=False):
         return None, "INVALID"
 
 
+def sanitize_source_value(value):
+    """Canonical source text; preserve case, accents, punctuation and word boundaries."""
+    if value is None:
+        return None
+    text = unicodedata.normalize("NFC", str(value))
+    text = re.sub(r"[\ufeff\u200b\u2060]", "", text)
+    text = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _parse_source_value(value, kind, allow_dash):
+    cleaned = sanitize_source_value(value)
+    changed = value is not None and cleaned != value
+    if cleaned is not None and "\ufffd" in cleaned:
+        return None, "INVALID", changed
+    if kind != "object":
+        parsed, status = parse_numeric(cleaned, kind, allow_dash=allow_dash)
+        return parsed, status, changed
+    missing = cleaned is None or cleaned.upper() in C.MISSING_VALUES
+    return (None, "MISSING", changed) if missing else (cleaned, "VALID", changed)
+
+
 def _sample(frame, columns):
     cols = list(dict.fromkeys(c for c in columns if c in frame.columns))
     return [row.asDict() for row in frame.select(*cols).limit(C.VALIDATION_SAMPLE_LIMIT).collect()] if cols else []
@@ -258,12 +281,18 @@ def validate_and_cast_source(raw, dataset, report, source, cache_frames):
         if dataset == "ECOMMERCE_FACT"
         else ["ID_INTERNO", "UPC", "ID_IMPORT", "ID_STORE"]
     )
-    parse_schema = T.StructType([T.StructField("value", T.StringType()), T.StructField("status", T.StringType())])
-    for column in numeric_columns:
+    parse_schema = T.StructType(
+        [
+            T.StructField("value", T.StringType()),
+            T.StructField("status", T.StringType()),
+            T.StructField("changed", T.BooleanType()),
+        ]
+    )
+    for column in columns:
         kind = types[column]
 
         def parser(value, expected_kind=kind, allow_dash=column in nullable):
-            return parse_numeric(value, expected_kind, allow_dash=allow_dash)
+            return _parse_source_value(value, expected_kind, allow_dash)
 
         working = working.withColumn("_PARSE_" + column, F.udf(parser, parse_schema)(F.col(column)))
     working = working.cache()
@@ -273,12 +302,14 @@ def validate_and_cast_source(raw, dataset, report, source, cache_frames):
         F.sum(F.when(F.col("_CSV_ERROR").isNotNull(), 1).otherwise(0)).alias("CSV"),
     ]
     for column in columns:
-        missing = F.col(column).isNull() | F.upper(F.trim(F.col(column))).isin(*C.MISSING_VALUES)
+        missing = F.col("_PARSE_" + column + ".status") == "MISSING"
         if column in mandatory:
             expressions.append(F.sum(F.when(missing, 1).otherwise(0)).alias("MISSING_" + column))
-        if column in numeric_columns:
-            invalid = F.col("_PARSE_" + column + ".status") == "INVALID"
-            expressions.append(F.sum(F.when(invalid, 1).otherwise(0)).alias("INVALID_" + column))
+        invalid = F.col("_PARSE_" + column + ".status") == "INVALID"
+        expressions.append(F.sum(F.when(invalid, 1).otherwise(0)).alias("INVALID_" + column))
+        expressions.append(
+            F.sum(F.when(F.col("_PARSE_" + column + ".changed"), 1).otherwise(0)).alias("CLEANED_" + column)
+        )
         if column in nullable:
             missing = F.col("_PARSE_" + column + ".status") == "MISSING"
             expressions.append(F.sum(F.when(missing, 1).otherwise(0)).alias("OPTIONAL_MISSING_" + column))
@@ -289,7 +320,7 @@ def validate_and_cast_source(raw, dataset, report, source, cache_frames):
     for column in columns:
         if column in mandatory:
             n = stats["MISSING_" + column] or 0
-            condition = F.col(column).isNull() | F.upper(F.trim(F.col(column))).isin(*C.MISSING_VALUES)
+            condition = F.col("_PARSE_" + column + ".status") == "MISSING"
             report.add(
                 dataset,
                 "MANDATORY_" + column,
@@ -299,21 +330,39 @@ def validate_and_cast_source(raw, dataset, report, source, cache_frames):
                 source=source,
                 sample=_sample(working.where(condition), keys + [column]) if n else None,
             )
-        if column in numeric_columns:
-            n = stats["INVALID_" + column] or 0
-            report.add(
-                dataset,
-                "TYPE_" + column,
-                n,
-                category="TYPE",
-                column=column,
-                source=source,
-                description=f"Expected a finite {'integer' if types[column] == 'int64' else 'number'}; malformed values are rejected.",
-                sample=_sample(working.where(F.col("_PARSE_" + column + ".status") == "INVALID"), keys + [column])
-                if n
-                else None,
-            )
-            bad_types |= bool(n)
+        n = stats["INVALID_" + column] or 0
+        report.add(
+            dataset,
+            "TYPE_" + column,
+            n,
+            category="TYPE",
+            column=column,
+            source=source,
+            description=(
+                "Expected valid Unicode text; replacement characters are rejected."
+                if types[column] == "object"
+                else f"Expected a finite {'integer' if types[column] == 'int64' else 'number'}; malformed values are rejected."
+            ),
+            sample=_sample(working.where(F.col("_PARSE_" + column + ".status") == "INVALID"), keys + [column])
+            if n
+            else None,
+        )
+        bad_types |= bool(n)
+        n = stats["CLEANED_" + column] or 0
+        cleaned_rows = working.where(F.col("_PARSE_" + column + ".changed")).withColumn(
+            "SANITIZED_VALUE", F.col("_PARSE_" + column + ".value")
+        )
+        report.add(
+            dataset,
+            "SANITIZED_" + column,
+            n,
+            category="SANITIZATION",
+            severity="WARNING",
+            column=column,
+            source=source,
+            description="Normalized Unicode and whitespace; removed invisible BOM/zero-width markers and replaced control characters with spaces. Case, accents and punctuation are preserved.",
+            sample=_sample(cleaned_rows, keys + [column, "SANITIZED_VALUE"]) if n else None,
+        )
         if column in nullable:
             n = stats["OPTIONAL_MISSING_" + column] or 0
             report.add(
@@ -334,9 +383,7 @@ def validate_and_cast_source(raw, dataset, report, source, cache_frames):
     converted = []
     for column in columns:
         if types[column] == "object":
-            expr = F.when(F.upper(F.trim(F.col(column))).isin(*C.MISSING_VALUES), F.lit(None)).otherwise(
-                F.trim(F.col(column))
-            )
+            expr = F.col("_PARSE_" + column + ".value")
         else:
             expr = F.col("_PARSE_" + column + ".value").cast("long" if types[column] == "int64" else "double")
         converted.append(expr.alias(column))

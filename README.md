@@ -52,7 +52,7 @@ de duplicados, y los joins de QA siguen usando RUN_ID + ID.
 
 ### Actualizar tablas creadas con versiones anteriores
 
-La versión 3.1 usa UNIDADES Double y elimina SKU/PRODUCT_SKU/BU. Reconoce las
+La versión 3.2 usa UNIDADES Double y elimina SKU/PRODUCT_SKU/BU. Reconoce las
 tablas de 3.0 con UNIDADES Long y los campos antiguos adicionales; solo las
 actualiza automáticamente si la tabla está **vacía**. Delta usa overwriteSchema
 sobre cero filas; Snowflake usa CREATE OR REPLACE con COPY GRANTS después de
@@ -61,6 +61,52 @@ y el schema Hive no se recrean. Una tabla poblada o un cambio de tipos desconoci
 se rechaza y requiere una migración explícita. Mantén detenidos los otros escritores.
 Estos DDL ocurren antes de la transacción de carga; la atomicidad de datos
 Snowflake sigue cubriendo las cuatro tablas de negocio.
+
+## Limpieza de valores y reset de pruebas
+
+Desde 3.2, todos los valores fuente pasan por limpieza antes de comprobar tipos,
+obligatoriedad, duplicados y referencias. Normaliza Unicode NFC, convierte espacios
+Unicode y secuencias de espacios a un espacio, recorta los extremos, elimina BOM,
+zero-width space y word joiner, y reemplaza caracteres de control por espacios para
+conservar los límites entre palabras. Mantiene mayúsculas, acentos y puntuación.
+Por ejemplo, `"  Cafe\u0301\u00a0 Danone\u200b "` se guarda como `"Café Danone"`.
+Los caracteres de reemplazo de una codificación dañada (`�`) generan ERROR.
+Los valores numéricos desconocidos siguen fallando; no se eliminan símbolos de
+moneda ni separadores para adivinar un número. El marcador `-` solo es NULL en
+UNIDADES, MONTO y FACTOR_CONVERSION; los IDs siguen siendo obligatorios.
+
+Cada columna modificada genera `SANITIZED_<COLUMNA>` con WARNING, conteo, claves,
+valor original y `SANITIZED_VALUE` en las muestras de logs y Delta. Los destinos
+de negocio solo reciben las columnas aprobadas y los valores limpios; las
+columnas internas de limpieza no se escriben. Los duplicados se rechazan después
+de limpiar; no se eliminan filas. Los CSV de origen se conservan sin reescritura.
+
+El usuario identificó las tablas configuradas actuales como sus tablas de prueba.
+Para dejarlas vacías con el contrato actual, ejecuta manualmente
+[notebooks/reset_ecommerce_test_tables.py](notebooks/reset_ecommerce_test_tables.py).
+Este notebook **elimina todas las filas de todos los años y snapshots** de las
+siguientes tablas de negocio:
+
+| Sistema | Tablas de prueba que se reinician |
+| --- | --- |
+| Delta, `hive_metastore.ecomm_dph` | `catalog_edp`, `catalog_waters`, `catalog_store`, `fact_ecommerce_staging`, `fact_ecommerce_danone` |
+| Snowflake, `PRD_MDP.MDP_STG` | `CATALOG_EDP`, `CATALOG_WATERS`, `CATALOG_STORE`, `FACT_ECOMMERCE_DANONE` |
+
+1. Sincroniza `main`, reinicia Python y detén los jobs y todos los otros escritores.
+2. Ejecuta el notebook de reset una vez. Debe mostrar **nueve tablas con ROWS_AFTER=0**.
+3. Vuelve a subir los cuatro CSV a `incoming` y ejecuta el job, por ejemplo con
+   `ANIO=2026`, `MES=ALL`, `FORCE_REPROCESS=true`.
+4. Ejecuta QA con el mismo periodo para consultar las ventas cruzadas y los avisos.
+
+El reset conserva `PIPELINE_RUNS`, `ecommerce_validation_results`, el schema Hive
+y los CSV de `incoming/current`. Usa `FORCE_REPROCESS=true` porque el historial
+de cargas exitosas anteriores permanece. Snowflake usa CREATE OR REPLACE con
+COPY GRANTS y necesita OWNERSHIP o equivalente; Delta sobrescribe explícitamente
+toda la tabla y su esquema, incluso si el modo de particiones del cluster es
+dynamic. Este mantenimiento no es atómico entre tablas/sistemas: si falla,
+consulta TABLE_NAME/COMPLETED_TABLES y vuelve a ejecutar el reset completo.
+No se ejecuta como parte del job habitual. Aquí se entrega el código; las tablas
+remotas se reinician al ejecutar el notebook en tu Databricks.
 
 ## Archivo anual: MES=ALL
 
@@ -182,7 +228,8 @@ ecomm-etl/                         # raíz del proyecto ecommerce_danone
 │   └── main.py
 ├── notebooks/
 │   ├── job_ecommerce_danone.py
-│   └── qa_ecommerce_danone.py
+│   ├── qa_ecommerce_danone.py
+│   └── reset_ecommerce_test_tables.py
 ├── tests/                         # opcional, no requerido por el ETL
 │   ├── conftest.py
 │   ├── test_extract.py
@@ -594,7 +641,7 @@ Las pruebas locales usan Python 3.12, Spark 4.0.4 y Delta Lake 4.0.1 e incluyen
 un lote completo de cuatro CSV con cargas Delta y movimientos locales de archivos
 reales. La suite también comprueba creación de las cuatro tablas, rechazo de
 esquemas incompatibles, rollback de cambios en catálogos/fact, joins históricos
-sin multiplicación y los dos notebooks. Snowflake se ejercita con dobles de
+sin multiplicación, la sanitización y los notebooks de job, QA y reset. Snowflake se ejercita con dobles de
 conexión; la ejecución integral en tu Databricks/Snowflake está pendiente.
 
 La suite incluye tres escenarios QA: un mes, un año con distintas

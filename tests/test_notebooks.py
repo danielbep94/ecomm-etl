@@ -4,6 +4,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from src import load as L
 from src import main as M
 from src.transform import ValidationError
 
@@ -65,6 +66,34 @@ def test_blank_job_parameters_do_not_start_pipeline(monkeypatch):
     with pytest.raises(ValidationError, match="ANIO"):
         execute_notebook("job_ecommerce_danone.py", {})
     run.assert_not_called()
+
+
+def test_reset_notebook_targets_business_tables_and_calls_reset_once(monkeypatch, capsys):
+    from conf import credentials
+    from conf import settings as C
+
+    delta_tables = [
+        C.CATALOG_EDP_TABLE,
+        C.CATALOG_WATERS_TABLE,
+        C.CATALOG_STORE_TABLE,
+        C.FACT_STAGING_TABLE,
+        C.FACT_CURATED_TABLE,
+    ]
+    snowflake_tables = list(C.SNOWFLAKE_CATALOG_TABLES.values()) + [C.TARGET_SNOWFLAKE_TABLE]
+    targets = [("DELTA", t) for t in delta_tables] + [("SNOWFLAKE", t) for t in snowflake_tables]
+    monkeypatch.setattr(
+        L,
+        "_empty_business_tables",
+        lambda _: ([(t, Mock(), None) for t in delta_tables], dict.fromkeys(snowflake_tables)),
+    )
+    monkeypatch.setattr(credentials, "get_snowflake_options", lambda _: {"configured": True})
+    reset = Mock(return_value=[{"SYSTEM": s, "TABLE_NAME": t, "ROWS_AFTER": 0} for s, t in targets])
+    monkeypatch.setattr(L, "reset_business_test_tables", reset)
+    runtime = execute_notebook("reset_ecommerce_test_tables.py", {})
+    reset.assert_called_once()
+    assert reset.call_args.args[:2] == (runtime["spark"], {"configured": True})
+    assert runtime["display"].call_count == 2
+    assert "EMPTY_TABLES=9" in capsys.readouterr().out
 
 
 def test_notebook_bootstrap_reports_missing_clone(monkeypatch, tmp_path):
