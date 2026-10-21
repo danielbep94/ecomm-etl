@@ -294,10 +294,6 @@ def _sample(frame, columns):
     return [row.asDict() for row in frame.select(*cols).limit(C.VALIDATION_SAMPLE_LIMIT).collect()] if cols else []
 
 
-def _count(frame):
-    return frame.count()
-
-
 def validate_and_cast_source(raw, dataset, report, source, cache_frames):
     columns, types, mandatory = C.SOURCE_DEFINITIONS[dataset]
     working = raw
@@ -698,12 +694,17 @@ def validate_negative_values(monthly, report, source=None):
     return units, amount
 
 
-def product_keys(edp, waters):
+def _product_catalog_rows(edp, waters, columns):
+    """Use one BU-tagged projection for product lookups and joins."""
     return (
-        edp.select("ID_INTERNO")
+        edp.select(*columns)
         .withColumn("NORMALIZED_BU", F.lit("EDP"))
-        .unionByName(waters.select("ID_INTERNO").withColumn("NORMALIZED_BU", F.lit("WATERS")))
+        .unionByName(waters.select(*columns).withColumn("NORMALIZED_BU", F.lit("WATERS")))
     )
+
+
+def product_keys(edp, waters):
+    return _product_catalog_rows(edp, waters, ["ID_INTERNO"])
 
 
 def coverage_metrics(fact, edp, waters, stores):
@@ -764,11 +765,7 @@ def validate_references(fact, edp, waters, stores, report, source=None):
 
 def enrich_fact(monthly, edp, waters, stores):
     product_cols = [c for c in C.EDP_EXPECTED_COLUMNS if c != "ID_INTERNO"]
-    products = (
-        edp.select(*C.EDP_EXPECTED_COLUMNS)
-        .withColumn("NORMALIZED_BU", F.lit("EDP"))
-        .unionByName(waters.select(*C.WATERS_EXPECTED_COLUMNS).withColumn("NORMALIZED_BU", F.lit("WATERS")))
-    )
+    products = _product_catalog_rows(edp, waters, C.PRODUCT_COLUMNS)
     p = products.select("ID_INTERNO", "NORMALIZED_BU", *[F.col(c).alias("PRODUCT_" + c) for c in product_cols])
     s = stores.select("ID_STORE", *[F.col(c).alias("STORE_" + c) for c in C.STORE_EXPECTED_COLUMNS if c != "ID_STORE"])
     return monthly.join(p, ["ID_INTERNO", "NORMALIZED_BU"], "left").join(s, "ID_STORE", "left")
@@ -879,11 +876,7 @@ def star_fact(frame):
 
 def versioned_coverage_metrics(fact, edp, waters, stores):
     """Join each fact to its validated catalog snapshot, including historical runs."""
-    products = (
-        edp.select("RUN_ID", "ID_INTERNO")
-        .withColumn("NORMALIZED_BU", F.lit("EDP"))
-        .unionByName(waters.select("RUN_ID", "ID_INTERNO").withColumn("NORMALIZED_BU", F.lit("WATERS")))
-    )
+    products = _product_catalog_rows(edp, waters, ["RUN_ID", "ID_INTERNO"])
     product_keys = ["RUN_ID", "ID_INTERNO", "NORMALIZED_BU"]
     store_keys = ["RUN_ID", "ID_STORE"]
     n = fact.count()
@@ -914,9 +907,7 @@ def join_star_fact(fact, edp, waters, stores):
     """
     attributes = [c for c in C.PRODUCT_COLUMNS if c != "ID_INTERNO"]
     products = (
-        edp.select("RUN_ID", *C.PRODUCT_COLUMNS)
-        .withColumn("NORMALIZED_BU", F.lit("EDP"))
-        .unionByName(waters.select("RUN_ID", *C.PRODUCT_COLUMNS).withColumn("NORMALIZED_BU", F.lit("WATERS")))
+        _product_catalog_rows(edp, waters, ["RUN_ID", *C.PRODUCT_COLUMNS])
         .select("RUN_ID", "ID_INTERNO", "NORMALIZED_BU", *[F.col(c).alias("PRODUCT_" + c) for c in attributes])
         .withColumn("PRODUCT_MATCHED", F.lit(True))
     )
@@ -953,11 +944,7 @@ def qa_sales_summary(joined_data):
 
 def infer_fact_bu(frame, edp, waters, report, source=None):
     """Classify the five-column fact by catalog membership, without expanding facts."""
-    memberships = (
-        edp.select("ID_INTERNO")
-        .withColumn("_CATALOG_BU", F.lit("EDP"))
-        .unionByName(waters.select("ID_INTERNO").withColumn("_CATALOG_BU", F.lit("WATERS")))
-    )
+    memberships = product_keys(edp, waters).withColumnRenamed("NORMALIZED_BU", "_CATALOG_BU")
     lookup = memberships.groupBy("ID_INTERNO").agg(
         F.countDistinct("_CATALOG_BU").alias("_BU_COUNT"), F.min("_CATALOG_BU").alias("_INFERRED_BU")
     )

@@ -11,10 +11,6 @@ from typing import Any, Dict, Optional
 from uuid import uuid4
 
 _MAX_ERROR_LENGTH = 4000
-_SENSITIVE_ASSIGNMENT = re.compile(
-    r"(?i)(password|passwd|pwd|token|secret|private[_-]?key|access[_-]?key)"
-    r"(\s*[:=]\s*)([^,;\s]+)"
-)
 
 
 def utc_now() -> datetime:
@@ -128,15 +124,6 @@ def metrics_to_json(metrics: Optional[Dict[str, Any]]) -> Optional[str]:
     return json.dumps(
         clean(metrics), default=_json_default, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False
     )
-
-
-def get_widget_value(dbutils, name: str, default: Optional[str] = None) -> Optional[str]:
-    try:
-        value = dbutils.widgets.get(name)
-    except Exception:
-        return default
-    normalized = str(value).strip()
-    return normalized if normalized else default
 
 
 @dataclass

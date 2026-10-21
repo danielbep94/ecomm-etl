@@ -76,7 +76,7 @@ El ETL copia la historia completa de catálogos Delta a staging y usa MERGE por
 RUN_ID + ID para insertar snapshots nuevos y actualizar vigencias de existentes,
 sin borrar historia. Crea cuatro staging transitorios con sufijo RUN_ID, comprueba
 conteos y registros, y abre una única transacción nativa: tres MERGE, reemplazo
-DELETE/INSERT del ANIO/MES de la fact, o de todo ANIO con MES=ALL,, conciliación exacta de las cuatro tablas y
+DELETE/INSERT del ANIO/MES de la fact, o de todo ANIO con MES=ALL, conciliación exacta de las cuatro tablas y
 verificación de joins de toda la fact, incluidos meses anteriores. Confirma todo
 con COMMIT o intenta ROLLBACK ante un error. Todo DDL ocurre fuera de la transacción.
 Al finalizar intenta eliminar los cuatro staging; las fallas quedan en métricas.
@@ -219,7 +219,7 @@ SANITIZED_VALUE. Los mismos valores limpios se escriben en Delta y Snowflake.
 
 ## Reset explícito de las tablas de prueba
 
-`notebooks/reset_ecommerce_test_tables.py` reinicia estas cuatro tablas y las cinco
+`tests/reset_ecommerce_test_tables.py` reinicia estas cuatro tablas y las cinco
 tablas Delta de negocio con el esquema actual, comprueba cero filas y preserva
 PIPELINE_RUNS, los hallazgos de validación y los CSV. El usuario confirmó que los
 destinos configurados son tablas de prueba. El reset descarta todas sus ventas y

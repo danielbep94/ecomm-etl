@@ -93,7 +93,9 @@ eliminan filas. Los CSV de origen se conservan sin reescritura.
 
 El usuario identificó las tablas configuradas actuales como sus tablas de prueba.
 Para dejarlas vacías con el contrato actual, ejecuta manualmente
-[notebooks/reset_ecommerce_test_tables.py](notebooks/reset_ecommerce_test_tables.py).
+[tests/reset_ecommerce_test_tables.py](tests/reset_ecommerce_test_tables.py).
+Desde 3.4, el notebook y sus funciones reutilizables están en `tests/`;
+el loader de producción no incluye operaciones de reset.
 Este notebook **elimina todas las filas de todos los años y snapshots** de las
 siguientes tablas de negocio:
 
@@ -276,14 +278,20 @@ ecomm-etl/                         # raíz del proyecto ecommerce_danone
 │   ├── run_tracking.py
 │   └── main.py
 ├── notebooks/
+│   ├── _bootstrap.py              # inicio compartido mediante %run
 │   ├── job_ecommerce_danone.py
-│   ├── qa_ecommerce_danone.py
-│   └── reset_ecommerce_test_tables.py
-├── tests/                         # opcional, no requerido por el ETL
+│   └── qa_ecommerce_danone.py
+├── tests/                         # pruebas y mantenimiento manual, fuera del wheel
+│   ├── README.md
+│   ├── __init__.py
 │   ├── conftest.py
+│   ├── reset_business_tables.py
+│   ├── reset_ecommerce_test_tables.py
+│   ├── snowflake_fakes.py
 │   ├── test_extract.py
 │   ├── test_transform.py
 │   ├── test_load.py
+│   ├── test_reset_tables.py
 │   ├── test_run_tracking.py
 │   ├── test_main.py
 │   └── test_notebooks.py
@@ -294,7 +302,10 @@ ecomm-etl/                         # raíz del proyecto ecommerce_danone
 
 `conf`, `logs` y `src` son paquetes namespace de Python; no se requieren archivos
 `__init__.py`. Los notebooks son puntos de entrada a las funciones existentes;
-la lógica ETL y QA permanece en `src/`. No se añaden frameworks de configuración,
+comparten la resolución de la raíz mediante `%run` de `notebooks/_bootstrap.py`.
+Clona la Git folder completa para conservar esas rutas relativas. El notebook de
+reset en `tests/` usa el mismo inicio y se ejecuta solo como mantenimiento manual.
+La lógica ETL y QA permanece en `src/`. No se añaden frameworks de configuración,
 schemas ni recursos adicionales.
 
 ## Requisitos en Databricks
@@ -347,6 +358,7 @@ schemas ni recursos adicionales.
 
    ```python
    import snowflake.connector
+
    print(snowflake.connector.__version__)
    ```
 
@@ -373,9 +385,7 @@ schemas ni recursos adicionales.
    JDBC compatibles con sus versiones de Spark y Scala. Comprueba la clase:
 
    ```python
-   spark._jvm.Thread.currentThread().getContextClassLoader().loadClass(
-       "net.snowflake.spark.snowflake.DefaultSource"
-   )
+   spark._jvm.Thread.currentThread().getContextClassLoader().loadClass("net.snowflake.spark.snowflake.DefaultSource")
    ```
 5. El principal del job necesita leer/escribir los dos directorios DBFS y las
    tablas Hive. Snowflake necesita acceso de red HTTPS al account configurado y
@@ -670,7 +680,8 @@ Filtros opcionales:
 
 ```python
 qa = run_qa_validation(
-    2025, 7,
+    2025,
+    7,
     logical_dataset="ECOMMERCE_FACT",
     bu="EDP",
     id_interno=123,
@@ -747,22 +758,23 @@ Las transacciones Snowflake se prueban con un doble de conexión; no ejecutan SQ
 contra la cuenta real. La validación integral de conectores, permisos y servicios
 corresponde a la prueba posterior en tu workspace Databricks.
 
-Los siete casos de integración con escritura real en Delta son opcionales: configura
+Los casos de integración con escritura real en Delta son opcionales: configura
 `ECOMM_TEST_DELTA_JARS` con las rutas de los JARs oficiales de Delta Spark y Delta
 Storage, separadas por coma, e instala el paquete Python `delta-spark` compatible.
-Sin esa variable se omiten explícitamente esos siete casos. En la validación de
+Sin esa variable se omiten explícitamente esos casos. En la validación de
 este desarrollo se ejecutaron con Spark 4.0.4, Delta 4.0.1, Python 3.12 y Java 21;
 los JARs se descargaron de Maven Central y se verificaron sus digests publicados.
 
 ### Validación realizada
 
-La suite completa terminó con **126 pruebas aprobadas, 0 fallos y 0 omitidas**.
+La suite completa comprueba el ETL, QA y las herramientas de reset separadas.
 Las pruebas locales usan Python 3.12, Spark 4.0.4 y Delta Lake 4.0.1 e incluyen
 un lote completo de cuatro CSV con cargas Delta y movimientos locales de archivos
 reales. La suite también comprueba creación de las cuatro tablas, rechazo de
 esquemas incompatibles, rollback de cambios en catálogos/fact, joins históricos
 sin multiplicación, la sanitización y los notebooks de job, QA y reset. Snowflake se ejercita con dobles de
-conexión; la ejecución integral en tu Databricks/Snowflake está pendiente.
+conexión; estas pruebas locales no ejecutan consultas en tu cuenta Snowflake.
 
-La suite incluye tres escenarios QA: un mes, un año con distintas
-versiones de catálogo por mes y la detección de un RUN_ID sin tracking exitoso.
+La suite incluye QA mensual, anual con distintas versiones de catálogo por mes,
+detección de un RUN_ID sin tracking exitoso y ventas repetidas conservadas con
+PASS_WITH_WARNINGS. El resumen de ventas incluye todas las ocurrencias.

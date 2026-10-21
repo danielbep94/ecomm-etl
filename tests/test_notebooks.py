@@ -1,27 +1,20 @@
 import ast
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
-from src import load as L
 from src import main as M
 from src.transform import ValidationError
+from tests import reset_business_tables as R
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def execute_notebook(name, values, *, path=None):
-    source = ROOT / "notebooks" / name
-    tree = ast.parse(source.read_text(), str(source))
-    # Simulate manually editing the configuration cell in the exported notebook.
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            key = node.targets[0].id
-            if key in values:
-                node.value = ast.parse(repr(values[key]), mode="eval").body
-    ast.fix_missing_locations(tree)
+    source = ROOT / name if "/" in name else ROOT / "notebooks" / name
     runtime = {
         "__name__": "__databricks_notebook__",
         "__file__": str(path or source),
@@ -29,7 +22,27 @@ def execute_notebook(name, values, *, path=None):
         "spark": Mock(),
         "display": Mock(),
     }
-    exec(compile(tree, str(source), "exec"), runtime)
+
+    def run_cells(notebook):
+        for cell in notebook.read_text().split("# COMMAND ----------"):
+            # Databricks %run executes the referenced notebook in the caller's namespace.
+            include = re.search(r"^# MAGIC %run (\S+)\s*$", cell, re.M)
+            if include:
+                target = (notebook.parent / include.group(1)).with_suffix(".py").resolve()
+                assert target.is_relative_to(ROOT), "A notebook include must stay inside the repository"
+                run_cells(target)
+                continue
+            tree = ast.parse(cell, str(notebook))
+            # Simulate manually editing the configuration cell in the exported notebook.
+            for node in tree.body:
+                if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                    key = node.targets[0].id
+                    if key in values:
+                        node.value = ast.parse(repr(values[key]), mode="eval").body
+            ast.fix_missing_locations(tree)
+            exec(compile(tree, str(notebook), "exec"), runtime)
+
+    run_cells(source)
     return runtime
 
 
@@ -83,14 +96,14 @@ def test_reset_notebook_targets_business_tables_and_calls_reset_once(monkeypatch
     snowflake_tables = list(C.SNOWFLAKE_CATALOG_TABLES.values()) + [C.TARGET_SNOWFLAKE_TABLE]
     targets = [("DELTA", t) for t in delta_tables] + [("SNOWFLAKE", t) for t in snowflake_tables]
     monkeypatch.setattr(
-        L,
-        "_empty_business_tables",
+        R,
+        "empty_business_tables",
         lambda _: ([(t, Mock(), None) for t in delta_tables], dict.fromkeys(snowflake_tables)),
     )
     monkeypatch.setattr(credentials, "get_snowflake_options", lambda _: {"configured": True})
     reset = Mock(return_value=[{"SYSTEM": s, "TABLE_NAME": t, "ROWS_AFTER": 0} for s, t in targets])
-    monkeypatch.setattr(L, "reset_business_test_tables", reset)
-    runtime = execute_notebook("reset_ecommerce_test_tables.py", {})
+    monkeypatch.setattr(R, "reset_business_test_tables", reset)
+    runtime = execute_notebook("tests/reset_ecommerce_test_tables.py", {})
     reset.assert_called_once()
     assert reset.call_args.args[:2] == (runtime["spark"], {"configured": True})
     assert runtime["display"].call_count == 2
