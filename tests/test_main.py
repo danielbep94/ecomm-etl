@@ -215,8 +215,13 @@ def test_cleanup_failure_does_not_replace_original_error(pipeline, monkeypatch):
     pipeline["tracking"].assert_called_once()
 
 
-@pytest.mark.parametrize("scope,missing_history", [(7, False), ("ALL", False), ("ALL", True)])
-def test_qa_uses_persisted_snapshots_without_incoming(spark, catalogs, monkeypatch, scope, missing_history):
+@pytest.mark.parametrize(
+    "scope,missing_history,repeated_sales",
+    [(7, False, False), ("ALL", False, False), ("ALL", True, False), ("ALL", False, True)],
+)
+def test_qa_uses_persisted_snapshots_without_incoming(
+    spark, catalogs, monkeypatch, scope, missing_history, repeated_sales
+):
     from src import transform as V
     from src.run_tracking import utc_now
 
@@ -231,7 +236,8 @@ def test_qa_uses_persisted_snapshots_without_incoming(spark, catalogs, monkeypat
         "FILE_YEAR": 2025,
     }
     source = spark.createDataFrame(
-        [(202507, 1, 1, 1, 10.0, "EDP")],
+        [(202507, 1, 1, 1, 10.0, "EDP")]
+        + ([(202507, 1, 1, 1, 10.0, "EDP"), (202507, 1, 1, 2, 5.0, "EDP")] if repeated_sales else []),
         "TIME_ID long, ID_STORE long, ID_INTERNO long, UNIDADES long, MONTO double, BU string",
     )
     source = V.star_fact(V.add_operational_metadata(V.normalize_bu(source), metadata, 2025, 7, timestamp=utc_now()))
@@ -297,20 +303,29 @@ def test_qa_uses_persisted_snapshots_without_incoming(spark, catalogs, monkeypat
     monkeypatch.setattr(M.E, "list_incoming_files", Mock(side_effect=AssertionError("QA must not read incoming")))
     result = M.run_qa_validation(2025, scope, id_interno="1e0", spark=spark, dbutils=Mock())
     assert len(result) == 18
-    assert result["qa_final_status"].first().STATUS == ("FAIL" if missing_history else "PASS")
-    assert result["qa_product_catalog_coverage"].first().MATCHED_PRODUCT_ROWS == (2 if scope == "ALL" else 1)
+    expected_status = "FAIL" if missing_history else "PASS_WITH_WARNINGS" if repeated_sales else "PASS"
+    assert result["qa_final_status"].first().STATUS == expected_status
+    rows_per_month = 3 if repeated_sales else 1
+    expected_rows = rows_per_month * (2 if scope == "ALL" else 1)
+    assert result["qa_product_catalog_coverage"].first().MATCHED_PRODUCT_ROWS == expected_rows
     joined = result["qa_joined_ecommerce_data"].orderBy("MES").collect()
-    assert len(joined) == (2 if scope == "ALL" else 1)
+    assert len(joined) == expected_rows
     assert joined[0].PRODUCT_NOMBRE == "Product" and joined[0].STORE_CADENA == "Chain"
     assert joined[0].PRODUCT_MATCHED and joined[0].STORE_MATCHED
-    assert joined[0].MONTO == 10.0
+    july = [row for row in joined if row.MES == 7]
+    assert sorted(row.MONTO for row in july) == ([5.0, 10.0, 10.0] if repeated_sales else [10.0])
     summary = result["qa_sales_summary"].orderBy("MES").collect()
     assert len(summary) == (2 if scope == "ALL" else 1)
     assert summary[0].ANIO == 2025 and summary[0].MES == 7
     assert summary[0].CADENA == "Chain" and summary[0].MARCA == "Brand"
-    assert summary[0].UNIDADES == 1.0 and summary[0].VENTAS == 10
+    assert summary[0].UNIDADES == (4.0 if repeated_sales else 1.0)
+    assert summary[0].VENTAS == (25 if repeated_sales else 10)
+    duplicates = result["qa_fact_duplicate_summary"].collect()
+    assert len(duplicates) == (2 if repeated_sales else 0)
+    if repeated_sales:
+        assert all(row.N == 3 and row.BUSINESS_VARIANTS == 2 for row in duplicates)
     if scope == "ALL":
-        assert joined[1].PRODUCT_NOMBRE == "Changed product" and joined[1].STORE_CADENA == "Changed chain"
+        assert joined[-1].PRODUCT_NOMBRE == "Changed product" and joined[-1].STORE_CADENA == "Changed chain"
         assert result["qa_catalog_duplicate_detail"].count() == 0
         assert result["qa_snowflake_star_relationships"].first().STATUS == "PASS"
         assert summary[1].MES == 8 and summary[1].CADENA == "Changed chain"
@@ -365,7 +380,12 @@ def test_complete_csv_batch_real_delta_and_file_movement(spark, catalogs, tmp_pa
     write_csv(
         C.FACT_FILE_TEMPLATE.format(ANIO=2025),
         C.FACT_EXPECTED_COLUMNS,
-        [(202507, 1, 1, 2.5, 20.0), (202508, 1, 2, " -   ", " -   ")],
+        [
+            (202507, 1, 1, 2.5, 20.0),
+            (202507, 1, 1, 2.5, 20.0),
+            (202507, 1, 1, 1.25, 5.0),
+            (202508, 1, 2, " -   ", " -   "),
+        ],
     )
 
     class LocalFS:
@@ -409,6 +429,10 @@ def test_complete_csv_batch_real_delta_and_file_movement(spark, catalogs, tmp_pa
 
     def snowflake_load(spark, options, frame, *args, **kwargs):
         assert set(kwargs["catalog_frames"]) == set(C.SNOWFLAKE_CATALOG_TABLES)
+        july = frame.where("MES=7")
+        assert july.count() == 3
+        assert july.where("UNIDADES=2.5 AND MONTO=20.0").count() == 2
+        assert july.agg(F.sum("MONTO")).first()[0] == 45.0
         metrics = M.L.frame_metrics(frame)
         return {"target_rows_before": 0, "target_rows_after": metrics["rows"], "reconciliation_status": "PASS"}
 
@@ -430,17 +454,21 @@ def test_complete_csv_batch_real_delta_and_file_movement(spark, catalogs, tmp_pa
     try:
         record = M.run_pipeline(2025, scope, False, spark=spark, dbutils=dbutils)
         assert record["STATUS"] == "SUCCEEDED"
-        expected_rows = 2 if scope == "ALL" else 1
+        expected_rows = 4 if scope == "ALL" else 3
         assert (
-            record["SOURCE_ROWS"] == 2
+            record["SOURCE_ROWS"] == 4
             and record["STAGING_ROWS"] == expected_rows
             and record["TRANSFORMED_ROWS"] == expected_rows
         )
         result = spark.table(C.FACT_CURATED_TABLE).orderBy("MES").collect()
-        assert len(result) == expected_rows and result[0].MES == 7 and result[0].MONTO == 20.0
-        assert result[0].UNIDADES == 2.5
+        assert len(result) == expected_rows and result[0].MES == 7
+        assert sorted((row.UNIDADES, row.MONTO) for row in result if row.MES == 7) == [
+            (1.25, 5.0),
+            (2.5, 20.0),
+            (2.5, 20.0),
+        ]
         if scope == "ALL":
-            assert result[1].MES == 8 and result[1].MONTO is None and result[1].UNIDADES is None
+            assert result[-1].MES == 8 and result[-1].MONTO is None and result[-1].UNIDADES is None
             assert str(record["PERIOD_START_DATE"]) == "2025-01-01"
             assert str(record["PERIOD_END_DATE"]) == "2025-12-31"
             assert spark.table(C.CATALOG_EDP_TABLE).first().MES is None
@@ -453,7 +481,17 @@ def test_complete_csv_batch_real_delta_and_file_movement(spark, catalogs, tmp_pa
         assert spark.table(C.VALIDATION_RESULTS_TABLE).where("VALIDATION_STATUS='WARNING'").count() >= 3
         assert {row.NORMALIZED_BU for row in result} == ({"EDP", "WATERS"} if scope == "ALL" else {"EDP"})
         metrics = __import__("json").loads(record["BUSINESS_METRICS_JSON"])
-        assert metrics["bu_derivation"]["derived_rows"] == 2
+        assert metrics["bu_derivation"]["derived_rows"] == 4
+        duplicates = (
+            spark.table(C.VALIDATION_RESULTS_TABLE)
+            .where("VALIDATION_CATEGORY='DUPLICATE' AND LOGICAL_DATASET='ECOMMERCE_FACT'")
+            .collect()
+        )
+        assert {row.VALIDATION_RULE: row.AFFECTED_ROWS for row in duplicates} == {
+            "EXACT_FACT_DUPLICATE": 2,
+            "DUPLICATE_BUSINESS_KEY": 1,
+        }
+        assert all(row.VALIDATION_STATUS == "WARNING" and row.SEVERITY == "WARNING" for row in duplicates)
         assert spark.table(C.VALIDATION_RESULTS_TABLE).where(F.col("VALIDATION_STATUS") == "FAIL").count() == 0
         assert list(incoming.iterdir()) == [] and len(list(current.iterdir())) == 4
         tracking.assert_called_once()

@@ -636,6 +636,10 @@ def validate_fact_duplicates(monthly, report, source=None):
         category="DUPLICATE",
         severity=C.FACT_EXACT_DUPLICATE_SEVERITY,
         source=source,
+        description=(
+            "Rows in groups with identical source values, including every occurrence. "
+            "All fact rows are retained without deduplication or aggregation."
+        ),
     )
     keys = ["TIME_ID", "ID_STORE", "ID_INTERNO", "NORMALIZED_BU"]
     detail = duplicate_groups(monthly, keys, C.FACT_EXPECTED_COLUMNS + ["NORMALIZED_BU"], ["UNIDADES", "MONTO"])
@@ -651,6 +655,10 @@ def validate_fact_duplicates(monthly, report, source=None):
         category="DUPLICATE",
         severity=C.FACT_BUSINESS_KEY_DUPLICATE_SEVERITY,
         source=source,
+        description=(
+            "Count of repeated date/store/product/BU key groups, not individual rows. "
+            "All fact rows are retained; DUPLICATE_DETAIL records identify each key and its row count."
+        ),
     )
     if n:
         report.add_detail(

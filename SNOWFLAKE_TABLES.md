@@ -28,6 +28,11 @@ UNIDADES, MONTO`; añade `NORMALIZED_BU, ANIO, MES` y siete columnas de
 trazabilidad: `RUN_ID, LOGICAL_DATASET, SOURCE_FILE_NAME, SOURCE_FILE_PATH,
 SOURCE_FILE_FINGERPRINT, SOURCE_FILE_YEAR, LOAD_TIMESTAMP_UTC`.
 
+La fact conserva todas las ocurrencias del archivo, incluso filas idénticas o
+varias ventas para la misma fecha/tienda/producto. Se marcan con WARNING sin
+deduplicación ni agregación. QA muestra las claves repetidas y devuelve
+PASS_WITH_WARNINGS si los demás controles pasan; sus sumas incluyen cada fila.
+
 Los catálogos añaden esas mismas siete columnas, ANIO/MES del lote, `CATALOG_BU`
 (solo productos) y `IS_ACTIVE, VALID_FROM_UTC, VALID_TO_UTC`. Los IDs son
 `NUMBER(19,0)`, los periodos/años `NUMBER(10,0)`, UNIDADES/MONTO/FACTOR_CONVERSION `DOUBLE` nullable, los textos

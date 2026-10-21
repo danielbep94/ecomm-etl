@@ -281,14 +281,28 @@ def test_missing_references_and_join_multiplication(spark, catalogs):
 
 def test_fact_duplicates_and_negative_warnings(spark):
     fact = spark.createDataFrame(
-        [(202507, 1, 1, -1.0, -10.0, "EDP"), (202507, 1, 1, -1.0, -10.0, "EDP")],
+        [
+            (202507, 1, 1, -1.0, -10.0, "EDP"),
+            (202507, 1, 1, -1.0, -10.0, "EDP"),
+            (202507, 1, 1, 2.5, 30.0, "EDP"),
+        ],
         "TIME_ID long, ID_STORE long, ID_INTERNO long, UNIDADES double, MONTO double, BU string",
     )
     fact = V.normalize_bu(fact)
     report = V.ValidationReport(spark, "r", 2025, 7)
     assert V.validate_fact_duplicates(fact, report) == 1
     assert V.validate_negative_values(fact, report) == (2, 2)
-    assert report.metrics()["warning_rules"] == 2
+    assert not report.failed and report.metrics()["warning_rules"] == 4
+    records = {row["VALIDATION_RULE"]: row for row in report.records}
+    assert records["EXACT_FACT_DUPLICATE"]["AFFECTED_ROWS"] == 2
+    assert records["DUPLICATE_BUSINESS_KEY"]["AFFECTED_ROWS"] == 1
+    for rule in ("EXACT_FACT_DUPLICATE", "DUPLICATE_BUSINESS_KEY"):
+        assert records[rule]["VALIDATION_STATUS"] == "WARNING"
+        assert records[rule]["SEVERITY"] == "WARNING"
+        assert "All fact rows are retained" in records[rule]["ERROR_DESCRIPTION"]
+    detail = report.dataframe().where("VALIDATION_CATEGORY='DUPLICATE_DETAIL'").first()
+    assert detail.VALIDATION_STATUS == "WARNING" and detail.SEVERITY == "WARNING"
+    assert detail.AFFECTED_ROWS == 3 and detail.ERROR_DESCRIPTION == "POTENTIAL_AGGREGATED_DUPLICATE"
 
 
 def test_valid_explicit_types_preserve_exact_long_values(spark, catalogs):

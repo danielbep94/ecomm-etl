@@ -87,8 +87,9 @@ UNIDADES, MONTO y FACTOR_CONVERSION; los IDs siguen siendo obligatorios.
 Cada columna modificada genera `SANITIZED_<COLUMNA>` con WARNING, conteo, claves,
 valor original y `SANITIZED_VALUE` en las muestras de logs y Delta. Los destinos
 de negocio solo reciben las columnas aprobadas y los valores limpios; las
-columnas internas de limpieza no se escriben. Los duplicados se rechazan después
-de limpiar; no se eliminan filas. Los CSV de origen se conservan sin reescritura.
+columnas internas de limpieza no se escriben. Después de limpiar, los duplicados
+en catálogos se rechazan y las repeticiones en la fact generan WARNING; no se
+eliminan filas. Los CSV de origen se conservan sin reescritura.
 
 El usuario identificó las tablas configuradas actuales como sus tablas de prueba.
 Para dejarlas vacías con el contrato actual, ejecuta manualmente
@@ -190,6 +191,13 @@ duplicados: `ID_INTERNO`, `UPC` e `ID_IMPORT` deben ser únicos dentro de cada
 catálogo de productos por snapshot; `ID_STORE` debe ser único en tiendas. Tanto
 copias idénticas como atributos conflictivos hacen fallar el lote; no se eliminan
 duplicados automáticamente ni se permite bajar su severidad a advertencia.
+
+La fact admite varias ventas por fecha/tienda/producto, incluso filas idénticas.
+Desde 3.3.1, `EXACT_FACT_DUPLICATE` y `DUPLICATE_BUSINESS_KEY` generan **WARNING**
+y permiten continuar si los demás controles pasan. Se conserva cada ocurrencia
+en Delta y Snowflake, sin deduplicar ni agregar. El primer conteo incluye todas
+las filas de grupos idénticos; el segundo cuenta claves repetidas. Estos conteos
+se solapan. Los detalles persistidos identifican cada clave y su número de filas.
 
 Tras pasar la validación, se persisten las tablas Delta y se concilia staging
 Snowflake. Los tres MERGE de catálogos y el reemplazo del periodo de la fact se
@@ -589,8 +597,9 @@ nulos, intento 0 y trigger `INTERACTIVE`.
 5. Valida duplicados de todas las claves solicitadas, colisiones entre catálogos,
    año/formato de TIME_ID, BU, cobertura de productos/tiendas y multiplicación de
    joins. No elimina ni agrega registros duplicados.
-6. Por defecto, duplicados y colisiones generan ERROR; montos/unidades negativos
-   generan WARNING y se conservan como devoluciones/ajustes.
+6. Los duplicados en catálogos y las colisiones entre catálogos generan ERROR.
+   Las filas repetidas en la fact generan WARNING y se conservan todas.
+   Los montos/unidades negativos generan WARNING y se conservan como devoluciones/ajustes.
 7. Persiste resultados PASS/WARNING/FAIL y detalles distribuidos de claves en
    `ecomm_dph.ecommerce_validation_results`. Los logs muestran reglas, conteos,
    columna, explicación y muestras acotadas de claves y valores afectados cuando
@@ -697,6 +706,12 @@ Una misma clave en distintos RUN_ID representa versiones históricas y no es un
 duplicado dentro de un snapshot. Los filtros de periodo, BU y IDs también se
 aplican al resultado cruzado. El notebook muestra todos los resultados antes de
 fallar la tarea cuando QA devuelve FAIL.
+
+Las repeticiones de la fact aparecen en `qa_fact_duplicate_summary` con sus claves
+y conteos. Por sí solas producen `PASS_WITH_WARNINGS`, sin fallar el notebook.
+`qa_joined_ecommerce_data` conserva todas las ocurrencias y `qa_sales_summary`
+incluye cada una en las sumas. Los duplicados de catálogos y la multiplicación
+de filas por joins siguen haciendo fallar QA.
 
 `qa_sales_summary` tiene exactamente `ANIO, MES, CADENA, MARCA, UNIDADES, VENTAS`.
 Agrupa los datos Snowflake cruzados por año/mes/cadena/marca con sus catálogos del
