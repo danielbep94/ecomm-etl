@@ -30,7 +30,7 @@ SOURCE_FILE_FINGERPRINT, SOURCE_FILE_YEAR, LOAD_TIMESTAMP_UTC`.
 
 Los catálogos añaden esas mismas siete columnas, ANIO/MES del lote, `CATALOG_BU`
 (solo productos) y `IS_ACTIVE, VALID_FROM_UTC, VALID_TO_UTC`. Los IDs son
-`NUMBER(19,0)`, los periodos/años `NUMBER(10,0)`, UNIDADES `NUMBER(19,0)`, MONTO/FACTOR_CONVERSION `DOUBLE`, los textos
+`NUMBER(19,0)`, los periodos/años `NUMBER(10,0)`, UNIDADES/MONTO/FACTOR_CONVERSION `DOUBLE` nullable, los textos
 `VARCHAR`, la bandera `BOOLEAN` y los timestamps operacionales `TIMESTAMP_NTZ`
 con valores UTC. `TIME_ID` mantiene YYYYMM o YYYYMMDD.
 
@@ -81,7 +81,7 @@ CREATE TABLE en el schema, SELECT/INSERT/UPDATE sobre catálogos,
 SELECT/INSERT/DELETE sobre fact y permisos para crear/cargar/leer/eliminar staging.
 El código valida el esquema existente y rechaza contratos incompatibles antes
 del DML. Solo actualiza automáticamente tablas vacías con el esquema anterior
-reconocido (SKU/BU/PRODUCT_SKU adicionales o UNIDADES Double): verifica COUNT(*)=0
+reconocido (SKU/BU/PRODUCT_SKU adicionales o UNIDADES NUMBER(19,0)): verifica COUNT(*)=0
 antes de CREATE OR REPLACE con COPY GRANTS. El rol necesita OWNERSHIP o equivalente
 para ese cambio. Tablas pobladas o esquemas desconocidos requieren una migración
 explícita; sus datos no se borran automáticamente.
@@ -180,11 +180,14 @@ reproceso consultan periodos solapados para proteger tanto cargas mensuales como
 anuales ya exitosas. QA anual une catálogos por RUN_ID, incluso si cada mes se
 cargó en un intento diferente.
 
-## Esquema aprobado, versión 3.0
+## Esquema aprobado, versión 3.1
 
 Los productos tienen doce columnas fuente sin SKU, la fact cinco sin BU y las
-tiendas cuatro con ID_STORE entero. UNIDADES se almacena como NUMBER(19,0), MONTO
-y FACTOR_CONVERSION como DOUBLE. No se crean columnas SKU, PRODUCT_SKU o BU en el
+tiendas cuatro con ID_STORE entero. UNIDADES, MONTO y FACTOR_CONVERSION se almacenan
+como DOUBLE nullable. El marcador `-` y los otros faltantes se conservan como NULL,
+con WARNING y muestras que identifican sus claves. No se imputa cero. Un factor
+no nulo cero/negativo sigue fallando, con muestras de producto y valor.
+No se crean columnas SKU, PRODUCT_SKU o BU en el
 modelo nuevo. NORMALIZED_BU es una columna operativa derivada desde el catálogo
 de cada producto y selecciona EDP o Waters en el join. El usuario confirmó que los
 ID_INTERNO son únicos entre ambos catálogos. Si no se cumple, la carga falla antes

@@ -38,7 +38,7 @@ def _delta_legacy_schema(actual, expected):
         and (set(old) - set(new)) <= {"SKU", "BU", "PRODUCT_SKU"}
         and all(
             old[name] == kind
-            or (name == "UNIDADES" and isinstance(old[name], T.DoubleType) and isinstance(kind, T.LongType))
+            or (name == "UNIDADES" and isinstance(old[name], T.LongType) and isinstance(kind, T.DoubleType))
             for name, kind in new.items()
         )
     )
@@ -345,8 +345,10 @@ def ensure_snowflake_table(cursor, table, frame):
                 _snowflake_contract_type_matches(field, actual[field.name])
                 or (
                     field.name == "UNIDADES"
-                    and isinstance(field.dataType, T.LongType)
-                    and actual[field.name][0].upper() in {"FLOAT", "DOUBLE", "REAL"}
+                    and isinstance(field.dataType, T.DoubleType)
+                    and actual[field.name][0].upper() in {"NUMBER", "FIXED", "DECIMAL", "NUMERIC"}
+                    and int(actual[field.name][2] or 0) == 0
+                    and int(actual[field.name][1] or 0) >= 19
                 )
                 for field in frame.schema
             )

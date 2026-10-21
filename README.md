@@ -11,16 +11,36 @@ El loader usa exactamente la estructura validada por el usuario:
 
 | Archivo / dataset | Columnas y tipos |
 | --- | --- |
-| Fact | TIME_ID, ID_STORE, ID_INTERNO, UNIDADES: enteros; MONTO: float. |
+| Fact | TIME_ID, ID_STORE, ID_INTERNO: enteros; UNIDADES y MONTO: float nullable. |
 | Catálogo EDP | ID_INTERNO, UPC, ID_IMPORT: enteros; FACTOR_CONVERSION: float; NOMBRE, MARCA, CATEGORIA, DESCRIPCION, EMPAQUE, FABRICANTE, SABOR, TAMANO: texto. |
 | Catálogo Waters | Las mismas doce columnas y tipos del catálogo EDP. |
 | Tiendas | ID_STORE: entero; TYPE, CADENA, CANAL: texto. |
 
 No existen SKU en productos ni BU en la fact fuente. Las cabeceras se validan
-contra estas listas exactas; no se insertan columnas SKU vacías. UNIDADES se
-valida como entero de 64 bits: 17 y 17.0 son válidos; 17.5 falla sin redondearse.
-MONTO y FACTOR_CONVERSION se mantienen como Double. Los identificadores también
+contra estas listas exactas; no se insertan columnas SKU vacías. UNIDADES admite
+fracciones como 17.5. UNIDADES, MONTO y FACTOR_CONVERSION usan Double y permiten
+NULL. En esas tres medidas se aceptan vacíos, NULL, NONE, N/A, NA y el marcador
+`-` con espacios exteriores como faltantes; se guardan como NULL, sin sustituir
+por cero ni eliminar la fila. Cada columna registra una regla NULLABLE_* con
+WARNING, conteo, archivo, claves y muestras de los valores originales. Los
+factores no nulos deben ser mayores que cero; un cero o negativo sigue siendo
+ERROR y ahora muestra ID_INTERNO/UPC/ID_IMPORT y el valor. Los números mal
+formados, NaN e infinito siguen siendo ERROR. Los identificadores
 usan LongType / NUMBER(19,0), evitando desbordar códigos UPC.
+
+Por ejemplo, una unidad ausente produce un log con `STATUS=WARNING`,
+`RULE=NULLABLE_UNIDADES`, `COLUMN_NAME=UNIDADES`, `AFFECTED_ROWS=2` y
+`SAMPLE_RECORDS_JSON=[{"TIME_ID":"202601","ID_STORE":"2197","ID_INTERNO":"1","UNIDADES":" -   "}, ...]`.
+Las muestras conservan el texto original; la fila cargada contiene NULL. Para
+consultar los hallazgos de una ejecución, incluye tanto WARNING como FAIL:
+
+```sql
+SELECT LOGICAL_DATASET, SOURCE_FILE_NAME, VALIDATION_RULE, COLUMN_NAME,
+       VALIDATION_STATUS, AFFECTED_ROWS, ERROR_DESCRIPTION, SAMPLE_RECORDS_JSON
+FROM hive_metastore.ecomm_dph.ecommerce_validation_results
+WHERE RUN_ID = '<run_id>'
+  AND VALIDATION_STATUS IN ('WARNING', 'FAIL');
+```
 
 El usuario confirmó que ID_INTERNO es único entre ambos catálogos y que ID_STORE
 es numérico. El ETL deriva solamente NORMALIZED_BU (EDP o WATERS) según el catálogo
@@ -32,8 +52,8 @@ de duplicados, y los joins de QA siguen usando RUN_ID + ID.
 
 ### Actualizar tablas creadas con versiones anteriores
 
-La versión 3.0 cambia los esquemas de negocio: elimina SKU/PRODUCT_SKU/BU y cambia
-UNIDADES de Double a Long. El ETL reconoce esos esquemas anteriores y solo los
+La versión 3.1 usa UNIDADES Double y elimina SKU/PRODUCT_SKU/BU. Reconoce las
+tablas de 3.0 con UNIDADES Long y los campos antiguos adicionales; solo las
 actualiza automáticamente si la tabla está **vacía**. Delta usa overwriteSchema
 sobre cero filas; Snowflake usa CREATE OR REPLACE con COPY GRANTS después de
 confirmar COUNT(*)=0. Solo aplica a las tablas de negocio configuradas. El tracker
@@ -120,7 +140,7 @@ No depende de los CSV ni ejecuta una nueva carga.
 - Los CSV son UTF-8, separados por coma, con cabecera, comillas dobles y comillas
   escapadas duplicándolas. Cada registro ocupa una línea física; los registros
   multilínea, vacíos, mal entrecomillados o con ancho incorrecto fallan validación.
-- Los identificadores y UNIDADES usan `LongType`, MONTO y FACTOR_CONVERSION usan `DoubleType` y los
+- Los identificadores usan `LongType`; UNIDADES, MONTO y FACTOR_CONVERSION usan `DoubleType` y los
   objetos `StringType`. No hay inferencia de esquema. Se aceptan representaciones
   enteras exactas como `1`, `1.0` y `1e3`, sin redondear identificadores.
 - `TIME_ID` usa **un solo formato por archivo**: `YYYYMM` o `YYYYMMDD`. Se
@@ -294,12 +314,14 @@ vacías o duplicadas generan ERROR.
   es Double; las demás columnas son String. En concreto los Long son
   `ID_INTERNO`, `UPC`, `ID_IMPORT`.
 - Tiendas: `ID_STORE` (Long), `TYPE`, `CADENA`, `CANAL` (String).
-- Fact anual: `TIME_ID, ID_STORE, ID_INTERNO, UNIDADES` (Long), `MONTO` (Double).
+- Fact anual: `TIME_ID, ID_STORE, ID_INTERNO` (Long), `UNIDADES, MONTO` (Double nullable).
 
 Se distinguen faltantes de valores numéricos mal formados; se rechazan fracciones
 en IDs, desbordamientos de Long, NaN e infinito. Los IDs son no negativos y el
-factor debe ser positivo. Los valores obligatorios vacíos, `NULL`, `NONE`, `N/A`
-y `NA` fallan. NORMALIZED_BU se deriva por pertenencia a los catálogos de producto.
+factor no nulo debe ser positivo. UNIDADES, MONTO y FACTOR_CONVERSION aceptan NULL
+y el marcador `-`, con WARNING identificable por claves en logs y Delta. Los
+valores obligatorios vacíos, `NULL`, `NONE`, `N/A` y `NA` fallan; los IDs no aceptan
+el marcador `-`. NORMALIZED_BU se deriva por pertenencia a los catálogos de producto.
 
 ## Usar el lote anual 2026 mostrado en Databricks
 
@@ -427,8 +449,9 @@ nulos, intento 0 y trigger `INTERACTIVE`.
 6. Por defecto, duplicados y colisiones generan ERROR; montos/unidades negativos
    generan WARNING y se conservan como devoluciones/ajustes.
 7. Persiste resultados PASS/WARNING/FAIL y detalles distribuidos de claves en
-   `ecomm_dph.ecommerce_validation_results`. Los logs muestran reglas y conteos,
-   no registros completos. Las muestras detalladas quedan solo en Delta.
+   `ecomm_dph.ecommerce_validation_results`. Los logs muestran reglas, conteos,
+   columna, explicación y muestras acotadas de claves y valores afectados cuando
+   existen hallazgos. Las mismas muestras quedan en SAMPLE_RECORDS_JSON en Delta.
 8. Después de validar todo, activa snapshots de catálogos con un MERGE Delta por
    catálogo. El mismo commit desactiva el snapshot anterior e inserta el nuevo;
    se preserva historia con RUN_ID, IS_ACTIVE y vigencias UTC.

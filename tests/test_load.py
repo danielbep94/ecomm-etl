@@ -57,8 +57,8 @@ def star_payloads(spark, catalogs):
         "FILE_YEAR": 2025,
     }
     source = spark.createDataFrame(
-        [(202507, 1, 1, 1, 10.0, "EDP"), (202507, 1, 2, 1, -2.5, "WATERS")],
-        "TIME_ID long, ID_STORE long, ID_INTERNO long, UNIDADES long, MONTO double, BU string",
+        [(202507, 1, 1, 1.5, 10.0, "EDP"), (202507, 1, 2, None, -2.5, "WATERS")],
+        "TIME_ID long, ID_STORE long, ID_INTERNO long, UNIDADES double, MONTO double, BU string",
     )
     fact = V.star_fact(V.add_operational_metadata(V.normalize_bu(source), metadata, 2025, 7, timestamp=utc_now()))
     dimensions = {}
@@ -415,9 +415,12 @@ def test_real_delta_annual_replacement_preserves_other_year(spark, monthly):
         spark.sql(f"DROP TABLE IF EXISTS {table}")
 
 
-def test_known_legacy_empty_snowflake_schema_is_updated(star_payloads):
+@pytest.mark.parametrize("extra_bu", [False, True])
+def test_known_legacy_empty_snowflake_schema_is_updated(star_payloads, extra_bu):
     fact, _, _ = star_payloads
-    legacy = fact.withColumn("BU", F.lit("EDP")).withColumn("UNIDADES", F.col("UNIDADES").cast("double"))
+    legacy = fact.withColumn("UNIDADES", F.col("UNIDADES").cast("long"))
+    if extra_bu:
+        legacy = legacy.withColumn("BU", F.lit("EDP"))
 
     class EmptyLegacyCursor(Cursor):
         def execute(self, sql):
@@ -442,17 +445,18 @@ def test_known_legacy_empty_snowflake_schema_is_updated(star_payloads):
 def test_delta_legacy_schema_upgrade_requires_empty_table(spark, monkeypatch, populated):
     table = "default.schema_" + uuid.uuid4().hex
     monkeypatch.setattr(C, "FACT_CURATED_TABLE", table)
-    expected = spark.createDataFrame([(2026, 1, 17)], "ANIO int, MES int, UNIDADES long")
-    legacy = expected.withColumn("UNIDADES", F.col("UNIDADES").cast("double")).withColumn("BU", F.lit("EDP"))
+    expected = spark.createDataFrame([(2026, 1, 17.5)], "ANIO int, MES int, UNIDADES double")
+    legacy = expected.withColumn("UNIDADES", F.col("UNIDADES").cast("long"))
     try:
         (legacy if populated else legacy.limit(0)).write.format("delta").saveAsTable(table)
         if populated:
             with pytest.raises(PipelineError, match="explicit migration"):
                 L.ensure_delta_table(spark, table, expected)
-            assert spark.table(table).count() == 1 and "BU" in spark.table(table).columns
+            assert spark.table(table).count() == 1
+            assert spark.table(table).schema["UNIDADES"].dataType.simpleString() == "bigint"
         else:
             L.ensure_delta_table(spark, table, expected)
             assert "BU" not in spark.table(table).columns
-            assert spark.table(table).schema["UNIDADES"].dataType.simpleString() == "bigint"
+            assert spark.table(table).schema["UNIDADES"].dataType.simpleString() == "double"
     finally:
         spark.sql(f"DROP TABLE IF EXISTS {table}")

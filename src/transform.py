@@ -169,6 +169,9 @@ class ValidationReport:
                 RULE=row["VALIDATION_RULE"],
                 AFFECTED_ROWS=row["AFFECTED_ROWS"],
                 SEVERITY=row["SEVERITY"],
+                COLUMN_NAME=row["COLUMN_NAME"],
+                DESCRIPTION=row["ERROR_DESCRIPTION"],
+                SAMPLE_RECORDS_JSON=row["SAMPLE_RECORDS_JSON"] if row["AFFECTED_ROWS"] else None,
             )
 
 
@@ -217,9 +220,9 @@ def validate_headers(headers, expected, report, dataset, source):
     return normalized if valid else None
 
 
-def parse_numeric(value, kind):
+def parse_numeric(value, kind, *, allow_dash=False):
     """Canonical string and status, avoiding lossy double casts for 64-bit IDs."""
-    if value is None or str(value).strip().upper() in C.MISSING_VALUES:
+    if value is None or str(value).strip().upper() in C.MISSING_VALUES or (allow_dash and str(value).strip() == "-"):
         return None, "MISSING"
     text = str(value).strip()
     if len(text) > 1024 or not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", text):
@@ -249,12 +252,18 @@ def validate_and_cast_source(raw, dataset, report, source, cache_frames):
     columns, types, mandatory = C.SOURCE_DEFINITIONS[dataset]
     working = raw
     numeric_columns = [c for c in columns if types[c] != "object"]
+    nullable = C.NULLABLE_NUMERIC_COLUMNS.get(dataset, ())
+    keys = (
+        ["TIME_ID", "ID_STORE", "ID_INTERNO"]
+        if dataset == "ECOMMERCE_FACT"
+        else ["ID_INTERNO", "UPC", "ID_IMPORT", "ID_STORE"]
+    )
     parse_schema = T.StructType([T.StructField("value", T.StringType()), T.StructField("status", T.StringType())])
     for column in numeric_columns:
         kind = types[column]
 
-        def parser(value, expected_kind=kind):
-            return parse_numeric(value, expected_kind)
+        def parser(value, expected_kind=kind, allow_dash=column in nullable):
+            return parse_numeric(value, expected_kind, allow_dash=allow_dash)
 
         working = working.withColumn("_PARSE_" + column, F.udf(parser, parse_schema)(F.col(column)))
     working = working.cache()
@@ -270,6 +279,9 @@ def validate_and_cast_source(raw, dataset, report, source, cache_frames):
         if column in numeric_columns:
             invalid = F.col("_PARSE_" + column + ".status") == "INVALID"
             expressions.append(F.sum(F.when(invalid, 1).otherwise(0)).alias("INVALID_" + column))
+        if column in nullable:
+            missing = F.col("_PARSE_" + column + ".status") == "MISSING"
+            expressions.append(F.sum(F.when(missing, 1).otherwise(0)).alias("OPTIONAL_MISSING_" + column))
     stats = working.agg(*expressions).first().asDict()
     report.add(dataset, "EMPTY_SOURCE", int(stats["ROWS"] == 0), category="MANDATORY", source=source)
     report.add(dataset, "CSV_RECORD_SHAPE", stats["CSV"] or 0, category="SCHEMA", source=source)
@@ -285,7 +297,7 @@ def validate_and_cast_source(raw, dataset, report, source, cache_frames):
                 category="MANDATORY",
                 column=column,
                 source=source,
-                sample=_sample(working.where(condition), [column]) if n else None,
+                sample=_sample(working.where(condition), keys + [column]) if n else None,
             )
         if column in numeric_columns:
             n = stats["INVALID_" + column] or 0
@@ -296,11 +308,27 @@ def validate_and_cast_source(raw, dataset, report, source, cache_frames):
                 category="TYPE",
                 column=column,
                 source=source,
-                sample=_sample(working.where(F.col("_PARSE_" + column + ".status") == "INVALID"), [column])
+                description=f"Expected a finite {'integer' if types[column] == 'int64' else 'number'}; malformed values are rejected.",
+                sample=_sample(working.where(F.col("_PARSE_" + column + ".status") == "INVALID"), keys + [column])
                 if n
                 else None,
             )
             bad_types |= bool(n)
+        if column in nullable:
+            n = stats["OPTIONAL_MISSING_" + column] or 0
+            report.add(
+                dataset,
+                "NULLABLE_" + column,
+                n,
+                category="NULLABLE",
+                severity="WARNING",
+                column=column,
+                source=source,
+                description="Accepted missing value or '-' placeholder; stored as NULL, without filling zero or dropping the row.",
+                sample=_sample(working.where(F.col("_PARSE_" + column + ".status") == "MISSING"), keys + [column])
+                if n
+                else None,
+            )
     if bad_types:
         return None, stats["ROWS"]
     converted = []
@@ -319,12 +347,16 @@ def validate_and_cast_source(raw, dataset, report, source, cache_frames):
             n = typed.where(F.col(column) < 0).count()
             report.add(dataset, "NONNEGATIVE_" + column, n, column=column, source=source)
     if "FACTOR_CONVERSION" in columns:
+        invalid_factors = typed.where(F.col("FACTOR_CONVERSION") <= 0)
+        n = invalid_factors.count()
         report.add(
             dataset,
             "POSITIVE_FACTOR_CONVERSION",
-            typed.where(F.col("FACTOR_CONVERSION") <= 0).count(),
+            n,
             column="FACTOR_CONVERSION",
             source=source,
+            description="NULL is allowed; a non-null conversion factor must be greater than zero.",
+            sample=_sample(invalid_factors, keys + ["FACTOR_CONVERSION"]) if n else None,
         )
     return typed, stats["ROWS"]
 

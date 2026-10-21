@@ -308,6 +308,7 @@ def test_complete_csv_batch_real_delta_and_file_movement(spark, catalogs, tmp_pa
             writer.writerows(rows)
 
     edp, waters, stores = catalogs
+    waters = waters.withColumn("FACTOR_CONVERSION", F.lit(None).cast("double"))
     for dataset, frame in [("EDP_CATALOG", edp), ("WATERS_CATALOG", waters), ("STORE_CATALOG", stores)]:
         columns = C.SOURCE_DEFINITIONS[dataset][0]
         write_csv(
@@ -318,7 +319,7 @@ def test_complete_csv_batch_real_delta_and_file_movement(spark, catalogs, tmp_pa
     write_csv(
         C.FACT_FILE_TEMPLATE.format(ANIO=2025),
         C.FACT_EXPECTED_COLUMNS,
-        [(202507, 1, 1, 2, 20.0), (202508, 1, 2, 1, 10.0)],
+        [(202507, 1, 1, 2.5, 20.0), (202508, 1, 2, " -   ", " -   ")],
     )
 
     class LocalFS:
@@ -391,14 +392,17 @@ def test_complete_csv_batch_real_delta_and_file_movement(spark, catalogs, tmp_pa
         )
         result = spark.table(C.FACT_CURATED_TABLE).orderBy("MES").collect()
         assert len(result) == expected_rows and result[0].MES == 7 and result[0].MONTO == 20.0
+        assert result[0].UNIDADES == 2.5
         if scope == "ALL":
-            assert result[1].MES == 8 and result[1].MONTO == 10.0
+            assert result[1].MES == 8 and result[1].MONTO is None and result[1].UNIDADES is None
             assert str(record["PERIOD_START_DATE"]) == "2025-01-01"
             assert str(record["PERIOD_END_DATE"]) == "2025-12-31"
             assert spark.table(C.CATALOG_EDP_TABLE).first().MES is None
         assert result[0].PRODUCT_MARCA == "Brand" and result[0].STORE_CADENA == "Chain"
         assert "SKU" not in spark.table(C.CATALOG_EDP_TABLE).columns
         assert "BU" not in spark.table(C.FACT_CURATED_TABLE).columns
+        assert spark.table(C.CATALOG_WATERS_TABLE).first().FACTOR_CONVERSION is None
+        assert spark.table(C.VALIDATION_RESULTS_TABLE).where("VALIDATION_STATUS='WARNING'").count() >= 3
         assert {row.NORMALIZED_BU for row in result} == ({"EDP", "WATERS"} if scope == "ALL" else {"EDP"})
         metrics = __import__("json").loads(record["BUSINESS_METRICS_JSON"])
         assert metrics["bu_derivation"]["derived_rows"] == 2

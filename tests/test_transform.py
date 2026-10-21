@@ -216,8 +216,8 @@ def test_approved_source_headers_are_exact(spark, dataset):
     assert report.failed
 
 
-@pytest.mark.parametrize("units,bad", [("17", False), ("17.5", True), ("-1", False)])
-def test_fact_units_follow_integer_contract(spark, units, bad):
+@pytest.mark.parametrize("units,bad", [("17", False), ("17.5", False), ("-1", False), ("oops", True)])
+def test_fact_units_follow_float_contract(spark, units, bad):
     raw = spark.createDataFrame(
         [("202601", "2197", "1", units, "109.42", None)],
         "TIME_ID string, ID_STORE string, ID_INTERNO string, UNIDADES string, MONTO string, _CSV_ERROR string",
@@ -227,10 +227,82 @@ def test_fact_units_follow_integer_contract(spark, units, bad):
         frame, count = V.validate_and_cast_source(raw, "ECOMMERCE_FACT", report, "fact.csv", cache)
         assert count == 1 and report.failed == bad
         if not bad:
-            assert frame.schema["UNIDADES"].dataType.simpleString() == "bigint"
+            assert frame.schema["UNIDADES"].dataType.simpleString() == "double"
+            assert frame.first().UNIDADES == float(units)
     finally:
         for frame in cache:
             frame.unpersist()
+
+
+def test_nullable_measures_preserve_rows_and_identify_raw_placeholders_in_logs(spark):
+    import json
+    from unittest.mock import Mock
+
+    raw = spark.createDataFrame(
+        [
+            ("202601", "2197", "1", " -   ", " -   ", None),
+            ("202601", "2197", "2", None, "NULL", None),
+            ("202601", "2197", "3", "17.5", "109.42", None),
+        ],
+        "TIME_ID string, ID_STORE string, ID_INTERNO string, UNIDADES string, MONTO string, _CSV_ERROR string",
+    )
+    report, cache = V.ValidationReport(spark, "nullable", 2026, "ALL"), []
+    try:
+        frame, count = V.validate_and_cast_source(raw, "ECOMMERCE_FACT", report, "fact.csv", cache)
+        assert count == 3 and not report.failed
+        rows = frame.orderBy("ID_INTERNO").collect()
+        assert len(rows) == 3
+        assert rows[0].UNIDADES is None and rows[0].MONTO is None
+        assert rows[1].UNIDADES is None and rows[1].MONTO is None
+        assert rows[2].UNIDADES == 17.5 and rows[2].MONTO == 109.42
+        warnings = [r for r in report.records if r["VALIDATION_STATUS"] == "WARNING"]
+        assert {r["VALIDATION_RULE"]: r["AFFECTED_ROWS"] for r in warnings} == {
+            "NULLABLE_UNIDADES": 2,
+            "NULLABLE_MONTO": 2,
+        }
+        logger = Mock()
+        report.log(logger)
+        logged = [call.kwargs for call in logger.event.call_args_list if call.kwargs["RULE"] == "NULLABLE_UNIDADES"][0]
+        sample = json.loads(logged["SAMPLE_RECORDS_JSON"])[0]
+        assert sample == {"TIME_ID": "202601", "ID_STORE": "2197", "ID_INTERNO": "1", "UNIDADES": " -   "}
+        assert logged["COLUMN_NAME"] == "UNIDADES" and "NULL" in logged["DESCRIPTION"]
+        assert V.parse_numeric(" -   ", "int64")[1] == "INVALID"  # IDs remain strict.
+    finally:
+        for item in cache:
+            item.unpersist()
+
+
+def test_nullable_conversion_factor_warns_and_invalid_factors_identify_products(spark, catalogs):
+    import json
+
+    edp, _, _ = catalogs
+    raw = edp.select(*[F.col(c).cast("string").alias(c) for c in C.EDP_EXPECTED_COLUMNS])
+    factors = spark.createDataFrame(
+        [("1", None), ("2", " -   "), ("3", "0"), ("4", "-0.2"), ("5", "0.1")],
+        "_ID string, _FACTOR string",
+    )
+    raw = (
+        raw.crossJoin(factors)
+        .withColumn("ID_INTERNO", F.col("_ID"))
+        .withColumn("FACTOR_CONVERSION", F.col("_FACTOR"))
+        .withColumn("_CSV_ERROR", F.lit(None).cast("string"))
+    )
+    report, cache = V.ValidationReport(spark, "factor", 2026, "ALL"), []
+    try:
+        frame, count = V.validate_and_cast_source(raw, "WATERS_CATALOG", report, "waters.csv", cache)
+        assert count == 5 and report.failed
+        assert frame.where("FACTOR_CONVERSION IS NULL").count() == 2
+        warnings = [r for r in report.records if r["VALIDATION_STATUS"] == "WARNING"]
+        assert len(warnings) == 1 and warnings[0]["VALIDATION_RULE"] == "NULLABLE_FACTOR_CONVERSION"
+        assert warnings[0]["AFFECTED_ROWS"] == 2
+        errors = [r for r in report.records if r["VALIDATION_STATUS"] == "FAIL"]
+        assert len(errors) == 1 and errors[0]["VALIDATION_RULE"] == "POSITIVE_FACTOR_CONVERSION"
+        assert errors[0]["AFFECTED_ROWS"] == 2
+        samples = json.loads(errors[0]["SAMPLE_RECORDS_JSON"])
+        assert {(r["ID_INTERNO"], r["FACTOR_CONVERSION"]) for r in samples} == {(3, 0.0), (4, -0.2)}
+    finally:
+        for item in cache:
+            item.unpersist()
 
 
 def test_missing_bu_is_derived_without_dropping_or_multiplying_fact_rows(spark, catalogs):
