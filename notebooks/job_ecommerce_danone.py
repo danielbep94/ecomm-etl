@@ -18,6 +18,13 @@
 
 # COMMAND ----------
 
+# Edit these variables manually before running the notebook.
+ANIO = 2026
+MES = "ALL"  # Use 1–12 for a month, or "ALL" for the selected year.
+FORCE_REPROCESS = True
+
+# COMMAND ----------
+
 import sys
 from pathlib import Path
 
@@ -53,25 +60,10 @@ if str(_repo_root) not in sys.path:
 # COMMAND ----------
 
 from src.main import run_pipeline
-from src.run_tracking import get_widget_value
 from src.transform import validate_parameters
 
-for _name in ("ANIO", "MES"):
-    try:
-        dbutils.widgets.get(_name)
-    except Exception:
-        dbutils.widgets.text(_name, "")
-try:
-    dbutils.widgets.get("FORCE_REPROCESS")
-except Exception:
-    dbutils.widgets.dropdown("FORCE_REPROCESS", "false", ["false", "true"])
-
 # Fail before starting a pipeline attempt if notebook parameters are incomplete.
-ANIO, MES, FORCE_REPROCESS = validate_parameters(
-    get_widget_value(dbutils, "ANIO"),
-    get_widget_value(dbutils, "MES"),
-    get_widget_value(dbutils, "FORCE_REPROCESS", "false"),
-)
+ANIO, MES, FORCE_REPROCESS = validate_parameters(ANIO, MES, FORCE_REPROCESS)
 
 # COMMAND ----------
 

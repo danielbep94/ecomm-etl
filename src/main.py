@@ -22,7 +22,6 @@ from src.run_tracking import (
     PipelineError,
     RunContext,
     append_run_record_safely,
-    get_widget_value,
     metrics_to_json,
     utc_now,
 )
@@ -507,22 +506,6 @@ def run_pipeline(anio, mes, force_reprocess=False, *, spark=None, dbutils=None):
     if final_status == "SUCCEEDED" and not tracking_written:
         raise RuntimeError("Business load succeeded, but the PIPELINE_RUNS tracking record could not be written.")
     return record
-
-
-def run_from_widgets(spark=None, dbutils=None):
-    spark, dbutils = _runtime(spark, dbutils)
-    for name, default in [("ANIO", ""), ("MES", "")]:
-        if get_widget_value(dbutils, name, None) is None:
-            dbutils.widgets.text(name, default)
-    if get_widget_value(dbutils, "FORCE_REPROCESS", None) is None:
-        dbutils.widgets.dropdown("FORCE_REPROCESS", "false", ["false", "true"])
-    return run_pipeline(
-        get_widget_value(dbutils, "ANIO"),
-        get_widget_value(dbutils, "MES"),
-        get_widget_value(dbutils, "FORCE_REPROCESS", "false"),
-        spark=spark,
-        dbutils=dbutils,
-    )
 
 
 def run_qa_validation(

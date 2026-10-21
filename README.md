@@ -119,11 +119,13 @@ remotas se reinician al ejecutar el notebook en tu Databricks.
 
 ## Archivo anual: MES=ALL
 
-Un archivo `...FULL_2026.csv` puede incluir los doce meses. Configura los widgets
-así para cargar el año en una sola ejecución:
+Un archivo `...FULL_2026.csv` puede incluir los doce meses. Edita la primera celda
+de variables del notebook así para cargar el año en una sola ejecución:
 
-```json
-{"ANIO":"2026", "MES":"ALL", "FORCE_REPROCESS":"false"}
+```python
+ANIO = 2026
+MES = "ALL"
+FORCE_REPROCESS = True
 ```
 
 `MES=ALL` carga todos los registros válidos del año y reemplaza **todo ANIO=2026**
@@ -466,18 +468,10 @@ record = run_pipeline(
 print(record["RUN_ID"], record["STATUS"])
 ```
 
-Si prefieres widgets:
-
-```python
-from src.main import run_from_widgets
-
-run_from_widgets(spark=spark, dbutils=dbutils)
-```
-
-La primera llamada crea los widgets `ANIO`, `MES` y `FORCE_REPROCESS` si no existen.
-Completa los valores antes de volver a ejecutarla. Los parámetros ya proporcionados
-por el job se conservan. Solo `true` / `false` se convierten a Boolean, evitando
-que el texto `"false"` se interprete como verdadero.
+Los notebooks usan variables Python que editas manualmente en su primera celda.
+Desde 3.2.4 se elimina la entrada `run_from_widgets` y no se crean ni leen widgets
+en los notebooks. Usa `True`/`False` para los booleanos; MES admite un entero de
+1 a 12 o el texto `"ALL"`.
 
 ## Notebooks de Databricks
 
@@ -489,11 +483,13 @@ de ejecutarlos, como se indica arriba.
 
 ### Notebook del job
 
-Abre `notebooks/job_ecommerce_danone.py`. Completa los widgets antes de ejecutar
-todas las celdas:
+Abre `notebooks/job_ecommerce_danone.py`. Edita las variables de su primera celda
+antes de ejecutar todas las celdas. Los valores incluidos son:
 
-```json
-{"ANIO":"2025","MES":"7","FORCE_REPROCESS":"false"}
+```python
+ANIO = 2026
+MES = "ALL"
+FORCE_REPROCESS = True
 ```
 
 El notebook valida los parámetros antes de iniciar el pipeline. Los valores
@@ -503,30 +499,39 @@ estado y conteos de filas. No recrea el schema ni instala dependencias.
 
 ### Notebook de QA
 
-Abre `notebooks/qa_ecommerce_danone.py`. Parámetros mínimos:
+Abre `notebooks/qa_ecommerce_danone.py`. Edita las variables de su primera celda
+con el mismo periodo de la carga:
 
-```json
-{"ANIO":"2025","MES":"7","FAIL_ON_QA_ERROR":"true"}
+```python
+ANIO = 2026
+MES = "ALL"
+FAIL_ON_QA_ERROR = True
+RUN_ID = None
+LOGICAL_DATASET = None
+BU = None
+ID_INTERNO = None
+ID_STORE = None
 ```
 
-Widgets opcionales, vacíos por defecto: `RUN_ID`, `LOGICAL_DATASET`, `BU`,
-`ID_INTERNO` e `ID_STORE`. Los filtros se pasan a `run_qa_validation` y se muestran
+Los filtros opcionales usan `None` por defecto. Para filtrar, asigna el valor
+a la variable correspondiente. Se pasan a `run_qa_validation` y se muestran
 sus diecisiete DataFrames, empezando por los datos cruzados e incluyendo el estado
 final. Con `FAIL_ON_QA_ERROR=true`, un
 estado `FAIL` hace fallar la tarea **después** de mostrar todos los resultados.
 `PASS_WITH_WARNINGS` no falla. Para inspección interactiva puedes ponerlo en
-`false`. El notebook QA no llama al ETL ni modifica tablas o archivos.
+`False`. El notebook QA no llama al ETL ni modifica tablas o archivos.
 
 ## Ejecución como job
 
 Crea una tarea de tipo **Notebook** con origen Git, repositorio
 `https://github.com/danielbep94/ecomm-etl.git`, rama `main`, y selecciona el notebook
-`notebooks/job_ecommerce_danone.py`. Usa el diccionario de parámetros anterior.
+`notebooks/job_ecommerce_danone.py`. Guarda y sincroniza los valores manuales de
+ANIO/MES/FORCE_REPROCESS en ese notebook; la tarea usa esa celda de código.
 Mantén **`max_concurrent_runs = 1`** para el job completo.
 
 Puedes añadir una segunda tarea Notebook con `notebooks/qa_ecommerce_danone.py`,
 dependiente de que la tarea ETL termine correctamente, y los mismos ANIO/MES.
-Deja RUN_ID vacío para revisar el snapshot persistido actual del periodo; puedes
+Deja RUN_ID en `None` para revisar el snapshot persistido actual del periodo; puedes
 copiar un RUN_ID de la salida del ETL para una inspección específica.
 
 La entrada Python script `src/main.py` sigue disponible. Sus argumentos son:

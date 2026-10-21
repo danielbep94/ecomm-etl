@@ -15,6 +15,18 @@
 
 # COMMAND ----------
 
+# Edit these variables manually; keep ANIO/MES equal to the loaded period.
+ANIO = 2026
+MES = "ALL"
+FAIL_ON_QA_ERROR = True
+RUN_ID = None
+LOGICAL_DATASET = None
+BU = None
+ID_INTERNO = None
+ID_STORE = None
+
+# COMMAND ----------
+
 import sys
 from pathlib import Path
 
@@ -50,35 +62,20 @@ if str(_repo_root) not in sys.path:
 # COMMAND ----------
 
 from src.main import run_qa_validation
-from src.run_tracking import get_widget_value
 from src.transform import validate_parameters
 
-for _name in ("ANIO", "MES", "RUN_ID", "LOGICAL_DATASET", "BU", "ID_INTERNO", "ID_STORE"):
-    try:
-        dbutils.widgets.get(_name)
-    except Exception:
-        dbutils.widgets.text(_name, "")
-try:
-    dbutils.widgets.get("FAIL_ON_QA_ERROR")
-except Exception:
-    dbutils.widgets.dropdown("FAIL_ON_QA_ERROR", "true", ["true", "false"])
-
-ANIO, MES, FAIL_ON_QA_ERROR = validate_parameters(
-    get_widget_value(dbutils, "ANIO"),
-    get_widget_value(dbutils, "MES"),
-    get_widget_value(dbutils, "FAIL_ON_QA_ERROR", "true"),
-)
+ANIO, MES, FAIL_ON_QA_ERROR = validate_parameters(ANIO, MES, FAIL_ON_QA_ERROR)
 
 # COMMAND ----------
 
 qa_results = run_qa_validation(
     ANIO,
     MES,
-    run_id=get_widget_value(dbutils, "RUN_ID"),
-    logical_dataset=get_widget_value(dbutils, "LOGICAL_DATASET"),
-    bu=get_widget_value(dbutils, "BU"),
-    id_interno=get_widget_value(dbutils, "ID_INTERNO"),
-    id_store=get_widget_value(dbutils, "ID_STORE"),
+    run_id=RUN_ID,
+    logical_dataset=LOGICAL_DATASET,
+    bu=BU,
+    id_interno=ID_INTERNO,
+    id_store=ID_STORE,
     spark=spark,
     dbutils=dbutils,
 )

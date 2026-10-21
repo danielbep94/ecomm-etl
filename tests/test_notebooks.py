@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -11,36 +12,36 @@ from src.transform import ValidationError
 ROOT = Path(__file__).resolve().parents[1]
 
 
-class Widgets:
-    def __init__(self, values):
-        self.values = dict(values)
-
-    def get(self, name):
-        return self.values[name]
-
-    def text(self, name, default):
-        self.values[name] = default
-
-    def dropdown(self, name, default, choices):
-        assert default in choices
-        self.values[name] = default
-
-
 def execute_notebook(name, values, *, path=None):
     source = ROOT / "notebooks" / name
+    tree = ast.parse(source.read_text(), str(source))
+    # Simulate manually editing the configuration cell in the exported notebook.
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            key = node.targets[0].id
+            if key in values:
+                node.value = ast.parse(repr(values[key]), mode="eval").body
+    ast.fix_missing_locations(tree)
     runtime = {
         "__name__": "__databricks_notebook__",
         "__file__": str(path or source),
-        "dbutils": SimpleNamespace(widgets=Widgets(values)),
+        "dbutils": SimpleNamespace(),  # No widget API: notebooks must use manual variables.
         "spark": Mock(),
         "display": Mock(),
     }
-    exec(compile(source.read_text(), str(source), "exec"), runtime)
+    exec(compile(tree, str(source), "exec"), runtime)
     return runtime
 
 
-@pytest.mark.parametrize("scope", ["7", "ALL"])
-def test_job_passes_boolean_parameters_and_displays_summary(monkeypatch, scope):
+@pytest.mark.parametrize(
+    "values,expected",
+    [
+        ({"ANIO": 2025, "MES": 7, "FORCE_REPROCESS": False}, (2025, 7, False)),
+        ({"ANIO": 2025, "MES": "ALL", "FORCE_REPROCESS": False}, (2025, "ALL", False)),
+        ({}, (2026, "ALL", True)),
+    ],
+)
+def test_job_passes_manual_parameters_and_displays_summary(monkeypatch, values, expected):
     run = Mock(
         return_value={
             "RUN_ID": "run-1",
@@ -53,8 +54,8 @@ def test_job_passes_boolean_parameters_and_displays_summary(monkeypatch, scope):
         }
     )
     monkeypatch.setattr(M, "run_pipeline", run)
-    runtime = execute_notebook("job_ecommerce_danone.py", {"ANIO": "2025", "MES": scope, "FORCE_REPROCESS": "false"})
-    assert run.call_args.args == (2025, "ALL" if scope == "ALL" else 7, False)
+    runtime = execute_notebook("job_ecommerce_danone.py", values)
+    assert run.call_args.args == expected
     assert run.call_args.kwargs == {"spark": runtime["spark"], "dbutils": runtime["dbutils"]}
     run.assert_called_once()
     runtime["display"].assert_called_once()
@@ -64,7 +65,7 @@ def test_blank_job_parameters_do_not_start_pipeline(monkeypatch):
     run = Mock()
     monkeypatch.setattr(M, "run_pipeline", run)
     with pytest.raises(ValidationError, match="ANIO"):
-        execute_notebook("job_ecommerce_danone.py", {})
+        execute_notebook("job_ecommerce_danone.py", {"ANIO": ""})
     run.assert_not_called()
 
 
@@ -104,7 +105,7 @@ def test_notebook_bootstrap_reports_missing_clone(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize(
     "status,fail_flag,raises",
-    [("PASS", "true", False), ("PASS_WITH_WARNINGS", "true", False), ("FAIL", "false", False), ("FAIL", "true", True)],
+    [("PASS", True, False), ("PASS_WITH_WARNINGS", True, False), ("FAIL", False, False), ("FAIL", True, True)],
 )
 def test_qa_displays_results_and_can_fail_task(monkeypatch, status, fail_flag, raises):
     output = {
