@@ -30,6 +30,7 @@ def pipeline(monkeypatch):
     monkeypatch.setattr(M, "_runtime", lambda *args: (spark, dbutils))
     monkeypatch.setattr(M, "databricks_context", lambda dbutils: {})
     monkeypatch.setattr(M, "get_snowflake_options", lambda _: {"configured": True})
+    monkeypatch.setattr(M.L, "get_snowflake_connector", Mock(return_value=Mock(__version__="test-connector")))
     monkeypatch.setattr(M.L, "verify_hive_objects", Mock())
     monkeypatch.setattr(M.E, "verify_runtime_directories", Mock())
     names = [C.FACT_FILE_TEMPLATE.format(ANIO=2025)] + [
@@ -169,6 +170,26 @@ def test_technical_failure_preserves_original_error_and_cleans_files(pipeline, m
     pipeline["move"].assert_not_called()
     pipeline["tracking"].assert_called_once()
     assert pipeline["tracking"].call_args.args[3]["STATUS"] == "FAILED"
+
+
+def test_missing_connector_is_detected_before_extraction_and_delta_writes(pipeline, monkeypatch):
+    failure = PipelineError("Missing Python module: snowflake", "RUNTIME_DEPENDENCY_ERROR")
+    monkeypatch.setattr(M.L, "get_snowflake_connector", Mock(side_effect=failure))
+    extract = Mock()
+    monkeypatch.setattr(M.E, "read_source_strings", extract)
+    publish = Mock()
+    monkeypatch.setattr(M.L, "load_snowflake_period", publish)
+    with pytest.raises(PipelineError) as captured:
+        M.run_pipeline(2025, "ALL", True)
+    assert captured.value is failure
+    extract.assert_not_called()
+    M.L.verify_hive_objects.assert_not_called()
+    M.L.load_catalog_snapshot.assert_not_called()
+    M.L.load_monthly_delta.assert_not_called()
+    publish.assert_not_called()
+    record = pipeline["tracking"].call_args.args[3]
+    assert record["ERROR_TYPE"] == "RUNTIME_DEPENDENCY_ERROR" and record["STATUS"] == "FAILED"
+    pipeline["delete"].assert_called_once()  # Existing submitted-batch cleanup policy.
 
 
 def test_tracking_failure_after_business_success_fails_job(pipeline):

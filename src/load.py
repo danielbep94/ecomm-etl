@@ -340,20 +340,32 @@ def _sql_type(kind):
     raise ValueError("Unsupported Snowflake column type")
 
 
-@contextlib.contextmanager
-def snowflake_connection(options):
+def get_snowflake_connector():
+    """Import the Python connector without connecting or changing any tables."""
     try:
         import snowflake.connector
-    except ImportError:
+    except ImportError as exc:
+        missing = getattr(exc, "name", None)
+        missing = (
+            missing
+            if isinstance(missing, str) and re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", missing)
+            else "unknown"
+        )
         raise PipelineError(
-            'Snowflake Python dependencies are missing or cannot be imported. In a Databricks cell run %pip install "snowflake-connector-python>=3.12,<5" "cryptography>=44,<51", then run dbutils.library.restartPython() in a separate cell and rerun the notebook.',
+            f'Missing or unusable Snowflake Python dependency: {missing}. In the SAME job notebook/Python environment run %pip install "snowflake-connector-python>=3.12,<5" "cryptography>=44,<51", then run dbutils.library.restartPython() in a separate cell and rerun the notebook. For scheduled jobs, install these as task libraries; a notebook-scoped install in the reset notebook is not shared with other tasks.',
             "RUNTIME_DEPENDENCY_ERROR",
         ) from None
+    return snowflake.connector
+
+
+@contextlib.contextmanager
+def snowflake_connection(options):
+    connector = get_snowflake_connector()
 
     conn = None
     try:
         host = options["sfURL"]
-        conn = snowflake.connector.connect(
+        conn = connector.connect(
             account=host.removesuffix(".snowflakecomputing.com"),
             user=options["sfUser"],
             private_key=base64.b64decode(options["pem_private_key"], validate=True),

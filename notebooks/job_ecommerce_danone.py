@@ -9,6 +9,12 @@
 # MAGIC ni se repite la inicialización de Hive/DBFS desde este notebook.
 # MAGIC Tras validar el lote, el ETL crea si faltan los tres catálogos y la fact
 # MAGIC Snowflake. El DDL manual está en `conf/snowflake_business_tables.sql`.
+# MAGIC Las librerías Python instaladas solo en el notebook de reset no se comparten
+# MAGIC con esta tarea. Instala `snowflake-connector-python>=3.12,<5` y
+# MAGIC `cryptography>=44,<51` como librerías de esta tarea, o mediante %pip en este
+# MAGIC mismo notebook y reinicia Python antes de volver a ejecutar desde el principio.
+# MAGIC El preflight valida el import antes de escribir tablas y registra la versión
+# MAGIC cargada y las rutas de los módulos para identificar código antiguo en caché.
 
 # COMMAND ----------
 

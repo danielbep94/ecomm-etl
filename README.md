@@ -294,6 +294,39 @@ schemas ni recursos adicionales.
    dependencias como librerías del job o instala el wheel del proyecto. Si el reset
    falla al importar/conectar, antes de su primer DDL, ninguna tabla se ha cambiado;
    desde 3.2.1 el error informa este caso y muestra el comando de instalación.
+
+   Una instalación `%pip` **solo en el notebook de reset** no instala dependencias
+   en el notebook de carga ni en otras tareas. Para una ejecución manual, instala
+   los paquetes en `job_ecommerce_danone.py` y reinicia Python allí. Para un Job,
+   añade `snowflake-connector-python>=3.12,<5` y `cryptography>=44,<51` como
+   librerías PyPI de la **tarea de carga** (y de cualquier otra tarea que las use),
+   o instala el wheel del proyecto con sus dependencias en esas tareas.
+
+   Antes de volver a subir los CSV, ejecuta **solo esta celda independiente** en
+   el notebook de carga. No requiere archivos ni ejecuta el ETL:
+
+   ```python
+   import snowflake.connector
+   print(snowflake.connector.__version__)
+   ```
+
+   Cuando el import funcione, deposita los cuatro CSV y ejecuta el job completo.
+   El usuario confirmó que la política sigue eliminando el lote después de
+   cualquier fallo; por eso conviene comprobar el entorno antes de subir archivos.
+
+   Desde 3.2.3 la carga comprueba el import del conector Python durante RUNTIME,
+   antes de leer/validar los CSV o escribir las tablas Delta de negocio. Registra
+   PIPELINE_VERSION, MAIN_MODULE, LOAD_MODULE, SETTINGS_MODULE y la versión del
+   conector para detectar código antiguo en caché o un wheel anterior. El error
+   de dependencias incluye el nombre del módulo ausente, sin credenciales.
+   La política existente de limpieza del lote ante fallos sigue vigente.
+
+   Si una versión anterior falló en STAGE=SNOWFLAKE, las tablas Delta ya pudieron
+   actualizarse. No interpretes ese estado como una carga completa ni como un
+   rollback entre sistemas. Corrige el entorno de la tarea, vuelve a subir los
+   cuatro CSV y reejecuta el mismo periodo con FORCE_REPROCESS=true. La carga
+   reemplaza el periodo y usa un RUN_ID nuevo; no es necesario otro reset por
+   un error de dependencia. Comprueba SUCCEEDED y ejecuta QA después.
 4. El conector **Spark de Snowflake** `net.snowflake.spark.snowflake` debe estar
    disponible en el Runtime. El conector Python no reemplaza ese JAR. Si tu
    Runtime no lo incluye, instala las versiones oficiales del conector Spark y

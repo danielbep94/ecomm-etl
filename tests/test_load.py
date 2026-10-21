@@ -571,6 +571,8 @@ def test_missing_snowflake_package_has_actionable_error_before_connection(monkey
             pytest.fail("A missing package must not open a connection")
     assert captured.value.error_type == "RUNTIME_DEPENDENCY_ERROR"
     assert "restartPython()" in str(captured.value)
+    assert "dependency: snowflake" in str(captured.value)
+    assert "SAME job notebook" in str(captured.value)
 
 
 @pytest.mark.parametrize("failure", ["dependency", "connection", "first_ddl"])

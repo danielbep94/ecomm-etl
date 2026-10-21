@@ -199,6 +199,16 @@ def run_pipeline(anio, mes, force_reprocess=False, *, spark=None, dbutils=None):
         period_start_date, period_end_date = V.period_bounds(anio, mes)
         logger.event(stage, "PASSED")
         stage = "RUNTIME"
+        logger.event(
+            stage,
+            "STARTED",
+            PIPELINE_VERSION=C.PIPELINE_VERSION,
+            MAIN_MODULE=__file__,
+            LOAD_MODULE=L.__file__,
+            SETTINGS_MODULE=C.__file__,
+        )
+        connector = L.get_snowflake_connector()
+        logger.event(stage, "PASSED", SNOWFLAKE_PYTHON_VERSION=getattr(connector, "__version__", "unknown"))
         L.verify_hive_objects(spark)
         E.verify_runtime_directories(dbutils)
         stage = "DISCOVERY"
