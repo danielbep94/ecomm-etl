@@ -361,7 +361,9 @@ def run_pipeline(anio, mes, force_reprocess=False, *, spark=None, dbutils=None):
         L.persist_validation_results(spark, report)
         if report.failed:
             raise V.ValidationError(
-                "The complete four-file batch failed validation; see persisted findings.", report.error_type
+                f"The complete four-file batch failed validation. Failed rules: {report.failure_summary()}. "
+                f"See {C.VALIDATION_RESULTS_TABLE} for RUN_ID={report.run_id}.",
+                report.error_type,
             )
         if transformed is None:
             raise V.ValidationError("A complete typed batch is required.", "SCHEMA_VALIDATION_ERROR")

@@ -138,6 +138,23 @@ def test_bad_header_fails_complete_batch_and_tracks_once(pipeline, monkeypatch):
     pipeline["tracking"].assert_called_once()
 
 
+def test_validation_exception_and_tracking_identify_the_failed_rule(pipeline, monkeypatch):
+    validate = M.V.validate_and_cast_source
+
+    def with_invalid_factor(raw, dataset, report, source, caches):
+        if dataset == "WATERS_CATALOG":
+            report.add(dataset, "POSITIVE_FACTOR_CONVERSION", 1, column="FACTOR_CONVERSION", source=source)
+        return validate(raw, dataset, report, source, caches)
+
+    monkeypatch.setattr(M.V, "validate_and_cast_source", with_invalid_factor)
+    with pytest.raises(M.V.ValidationError, match="WATERS_CATALOG.POSITIVE_FACTOR_CONVERSION") as captured:
+        M.run_pipeline(2025, "ALL", True)
+    assert "1 affected" in str(captured.value) and "RUN_ID=" in str(captured.value)
+    assert "WATERS_CATALOG.POSITIVE_FACTOR_CONVERSION" in pipeline["tracking"].call_args.args[3]["ERROR_MESSAGE"]
+    M.L.load_catalog_snapshot.assert_not_called()
+    M.L.load_monthly_delta.assert_not_called()
+
+
 def test_technical_failure_preserves_original_error_and_cleans_files(pipeline, monkeypatch):
     failure = PipelineError("Safe failure", "SNOWFLAKE_LOAD_ERROR")
 

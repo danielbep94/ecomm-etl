@@ -2,6 +2,7 @@
 
 import calendar
 import datetime as dt
+import json
 import math
 import re
 import unicodedata
@@ -160,8 +161,34 @@ class ValidationReport:
         frames = [self.spark.createDataFrame(self.records, VALIDATION_SCHEMA)] + self.detail_frames
         return reduce(lambda a, b: a.unionByName(b), frames)
 
+    def failure_summary(self, limit=5):
+        failed = [r for r in self.records if r["VALIDATION_STATUS"] == "FAIL"]
+        summary = "; ".join(
+            f"{r['LOGICAL_DATASET'] or 'BATCH'}.{r['VALIDATION_RULE']} ({r['AFFECTED_ROWS']} affected)"
+            for r in failed[:limit]
+        )
+        if len(failed) > limit:
+            summary += f"; +{len(failed) - limit} other failed rules"
+        return summary
+
     def log(self, logger):
-        for row in self.records:
+        stats = self.metrics()
+        logger.event(
+            "VALIDATION",
+            "FAIL" if self.failed else "WARNING" if stats["warning_rules"] else "PASS",
+            RULE="BATCH_VALIDATION_SUMMARY",
+            TOTAL_RULES=stats["total_rules"],
+            PASSED_RULES=stats["passed_rules"],
+            WARNING_RULES=stats["warning_rules"],
+            FAILED_RULES=stats["failed_rules"],
+            FAILED_RULES_SUMMARY=self.failure_summary() or None,
+            FINDINGS_TABLE=C.VALIDATION_RESULTS_TABLE,
+        )
+        findings = [r for r in self.records if r["VALIDATION_STATUS"] != "PASS"]
+        for row in sorted(findings, key=lambda r: r["VALIDATION_STATUS"] != "FAIL"):
+            sample = json.loads(row["SAMPLE_RECORDS_JSON"] or "[]")
+            if isinstance(sample, list):
+                sample = sample[: C.VALIDATION_LOG_SAMPLE_LIMIT]
             logger.event(
                 "VALIDATION",
                 row["VALIDATION_STATUS"],
@@ -172,7 +199,7 @@ class ValidationReport:
                 SEVERITY=row["SEVERITY"],
                 COLUMN_NAME=row["COLUMN_NAME"],
                 DESCRIPTION=row["ERROR_DESCRIPTION"],
-                SAMPLE_RECORDS_JSON=row["SAMPLE_RECORDS_JSON"] if row["AFFECTED_ROWS"] else None,
+                SAMPLE_RECORDS_JSON=metrics_to_json(sample),
             )
 
 

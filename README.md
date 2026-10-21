@@ -42,6 +42,15 @@ WHERE RUN_ID = '<run_id>'
   AND VALIDATION_STATUS IN ('WARNING', 'FAIL');
 ```
 
+Desde 3.2.2 el log empieza por BATCH_VALIDATION_SUMMARY con conteos y las reglas
+que fallaron, seguido por los errores y después las advertencias. Los PASS se
+guardan en Delta sin imprimir una línea por regla. El log muestra como máximo
+tres muestras por hallazgo; Delta conserva el límite de veinte y los detalles
+distribuidos existentes. La excepción final también incluye dataset/regla y
+conteo para que el diagnóstico sobreviva al truncamiento de salida de Databricks.
+Si aparece `max output size exceeded`, consulta los FAIL del RUN_ID con la SQL
+anterior: no se puede deducir el fallo a partir de las advertencias visibles.
+
 El usuario confirmó que ID_INTERNO es único entre ambos catálogos y que ID_STORE
 es numérico. El ETL deriva solamente NORMALIZED_BU (EDP o WATERS) según el catálogo
 al que pertenece cada ID_INTERNO; no crea una columna BU en los destinos. Productos

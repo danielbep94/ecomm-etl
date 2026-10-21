@@ -29,6 +29,43 @@ def test_numeric_validation(value, kind, status):
     assert V.parse_numeric(value, kind)[1] == status
 
 
+def test_validation_logs_failures_first_and_keeps_full_persisted_samples():
+    import json
+    from unittest.mock import Mock
+
+    report = V.ValidationReport(None, "log-run", 2026, "ALL")
+    samples = [{"ID_INTERNO": i, "FACTOR_CONVERSION": 0.0} for i in range(C.VALIDATION_SAMPLE_LIMIT)]
+    report.add("EDP_CATALOG", "SANITIZED_NOMBRE", 20, severity="WARNING", sample=samples)
+    for i in range(100):
+        report.add("ECOMMERCE_FACT", f"PASS_{i}")
+    report.add("WATERS_CATALOG", "POSITIVE_FACTOR_CONVERSION", 1, column="FACTOR_CONVERSION", sample=samples)
+    logger = Mock()
+    report.log(logger)
+    calls = logger.event.call_args_list
+    assert len(calls) == 3
+    assert calls[0].args == ("VALIDATION", "FAIL")
+    assert calls[0].kwargs["PASSED_RULES"] == 100 and calls[0].kwargs["FAILED_RULES"] == 1
+    assert "WATERS_CATALOG.POSITIVE_FACTOR_CONVERSION (1 affected)" in calls[0].kwargs["FAILED_RULES_SUMMARY"]
+    assert calls[1].kwargs["RULE"] == "POSITIVE_FACTOR_CONVERSION"
+    assert calls[2].kwargs["RULE"] == "SANITIZED_NOMBRE"
+    assert len(json.loads(calls[1].kwargs["SAMPLE_RECORDS_JSON"])) == C.VALIDATION_LOG_SAMPLE_LIMIT
+    assert len(json.loads(report.records[-1]["SAMPLE_RECORDS_JSON"])) == C.VALIDATION_SAMPLE_LIMIT
+    assert len(report.records) == 102  # PASS findings remain available for persistence.
+
+
+@pytest.mark.parametrize("failures", [0, 6])
+def test_failure_summary_is_bounded_and_reports_remaining_rules(failures):
+    report = V.ValidationReport(None, "summary")
+    for i in range(failures):
+        report.add("WATERS_CATALOG", f"FAIL_{i}", i + 1)
+    if failures:
+        assert "FAIL_0 (1 affected)" in report.failure_summary()
+        assert "FAIL_5" not in report.failure_summary()
+        assert "+1 other failed rules" in report.failure_summary()
+    else:
+        assert report.failure_summary() == ""
+
+
 @pytest.mark.parametrize(
     "raw,expected",
     [
