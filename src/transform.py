@@ -923,6 +923,26 @@ def join_star_fact(fact, edp, waters, stores):
     )
 
 
+def qa_sales_summary(joined_data):
+    """Net sales by actual month and versioned chain/brand; retain all-null totals."""
+    return (
+        joined_data.select(
+            "ANIO",
+            "MES",
+            F.col("STORE_CADENA").alias("CADENA"),
+            F.col("PRODUCT_MARCA").alias("MARCA"),
+            "UNIDADES",
+            "MONTO",
+        )
+        .groupBy("ANIO", "MES", "CADENA", "MARCA")
+        .agg(
+            F.sum(F.col("UNIDADES").cast("double")).alias("UNIDADES"),
+            F.sum(F.col("MONTO").cast("decimal(38,6)")).alias("VENTAS"),
+        )
+        .orderBy("ANIO", "MES", "CADENA", "MARCA")
+    )
+
+
 def infer_fact_bu(frame, edp, waters, report, source=None):
     """Classify the five-column fact by catalog membership, without expanding facts."""
     memberships = (

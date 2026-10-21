@@ -1,7 +1,7 @@
 # Databricks notebook source
 # MAGIC %md
 # MAGIC # E-commerce — QA persistido
-# MAGIC Usa `MES=ALL` para reemplazar el año seleccionado completo; `MES=1`–`12` carga un mes.
+# MAGIC Usa `MES=ALL` para consultar el año seleccionado completo; `MES=1`–`12` consulta un mes.
 # MAGIC MES vacío es inválido. Usa el mismo ANIO/MES de la carga para consultar sus datos.
 # MAGIC Define `ANIO` y `MES`; los filtros opcionales vacíos consultan el periodo completo.
 # MAGIC Este notebook lee Delta y Snowflake sin consultar `incoming` ni ejecutar cargas.
@@ -12,6 +12,7 @@
 # MAGIC productos EDP/Waters y tiendas por RUN_ID + ID. Incluye atributos PRODUCT_*/STORE_*
 # MAGIC y las banderas PRODUCT_MATCHED/STORE_MATCHED para localizar claves sin catálogo.
 # MAGIC También concilia los tres catálogos Snowflake y verifica los joins por RUN_ID.
+# MAGIC `qa_sales_summary` resume por ANIO/MES/CADENA/MARCA, con UNIDADES y VENTAS.
 
 # COMMAND ----------
 
@@ -94,12 +95,25 @@ display(qa_results["qa_joined_ecommerce_data"])
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## Resumen mensual por cadena y marca
+# MAGIC VENTAS = SUM(MONTO). Las devoluciones se incluyen con su signo original.
+# MAGIC Los totales de grupos con todas las medidas nulas permanecen nulos.
+
+# COMMAND ----------
+
+qa_sales_summary = qa_results["qa_sales_summary"]
+print("qa_sales_summary")
+display(qa_sales_summary)
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Resultados de validación
 
 # COMMAND ----------
 
 for _name, _dataframe in qa_results.items():
-    if _name != "qa_joined_ecommerce_data":
+    if _name not in {"qa_joined_ecommerce_data", "qa_sales_summary"}:
         print(_name)
         display(_dataframe)
 

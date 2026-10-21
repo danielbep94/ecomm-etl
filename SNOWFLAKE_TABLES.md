@@ -162,6 +162,9 @@ Ejecuta `notebooks/job_ecommerce_danone.py` y después
 de los controles existentes; no requiere volver a subir los CSV.
 `qa_joined_ecommerce_data` devuelve las ventas Snowflake con los atributos de
 productos/tiendas y banderas de coincidencia usando los joins anteriores.
+`qa_sales_summary` agrupa esos datos por ANIO, MES, CADENA y MARCA; devuelve
+SUM(UNIDADES) y SUM(MONTO) como VENTAS, conservando el signo de devoluciones y
+los totales nulos cuando todos los valores son NULL. Respeta los filtros de QA.
 Los catálogos rechazan cualquier duplicado por snapshot, incluso registros
 idénticos; las claves de versiones históricas se validan antes del staging.
 
@@ -172,6 +175,13 @@ anual usa `WHERE ANIO=2026`; todo ese año se sustituye con los registros del
 archivo, incluso si este contiene menos de doce meses. Los meses ausentes del
 archivo se eliminan del año reemplazado. Otros años se conservan. Sigue siendo
 una sola transacción Snowflake para los tres catálogos y la fact completa.
+
+Para cargar 2025 después de 2026, sube la fact FULL_2025 y los tres catálogos,
+usa ANIO=2025/MES="ALL" y FORCE_REPROCESS=False si 2025 no tiene una carga exitosa.
+El predicado pasa a WHERE ANIO=2025; los hechos 2026 y sus snapshots históricos
+siguen disponibles. No ejecutes el reset para añadir otro año. El resumen de
+filas del run cuenta únicamente el periodo seleccionado. Consulta QA para el
+año deseado mediante la variable manual ANIO.
 
 Las columnas y tipos de las cuatro tablas no cambian. La fact conserva el mes
 real derivado de TIME_ID; el campo MES del lote en catálogos/validaciones es NULL

@@ -29,6 +29,34 @@ def test_numeric_validation(value, kind, status):
     assert V.parse_numeric(value, kind)[1] == status
 
 
+def test_sales_summary_groups_all_dimensions_and_preserves_returns_and_nulls(spark):
+    from decimal import Decimal
+
+    joined = spark.createDataFrame(
+        [
+            (2026, 1, "Chain A", "Brand A", 1.25, 25.1),
+            (2026, 1, "Chain A", "Brand A", -0.25, -5.1),
+            (2026, 1, "Chain A", "Brand A", None, None),
+            (2026, 2, "Chain A", "Brand A", 2.0, 3.5),
+            (2025, 1, "Chain A", "Brand A", 3.0, 50.0),
+            (2026, 1, "Chain B", "Brand A", 4.0, 4.0),
+            (2026, 1, "Chain A", "Brand B", None, None),
+        ],
+        "ANIO int, MES int, STORE_CADENA string, PRODUCT_MARCA string, UNIDADES double, MONTO double",
+    )
+    summary = V.qa_sales_summary(joined)
+    assert summary.columns == ["ANIO", "MES", "CADENA", "MARCA", "UNIDADES", "VENTAS"]
+    rows = {(r.ANIO, r.MES, r.CADENA, r.MARCA): r for r in summary.collect()}
+    assert len(rows) == 5
+    net = rows[(2026, 1, "Chain A", "Brand A")]
+    assert net.UNIDADES == 1.0 and net.VENTAS == Decimal("20.000000")
+    assert rows[(2025, 1, "Chain A", "Brand A")].VENTAS == Decimal("50.000000")
+    assert rows[(2026, 2, "Chain A", "Brand A")].UNIDADES == 2.0
+    assert rows[(2026, 1, "Chain B", "Brand A")].UNIDADES == 4.0
+    missing = rows[(2026, 1, "Chain A", "Brand B")]
+    assert missing.UNIDADES is None and missing.VENTAS is None
+
+
 def test_validation_logs_failures_first_and_keeps_full_persisted_samples():
     import json
     from unittest.mock import Mock

@@ -399,18 +399,19 @@ def test_tracking_overlap_queries_protect_months_and_years(spark, monkeypatch):
 
 
 @pytest.mark.skipif(not os.environ.get("ECOMM_TEST_DELTA_JARS"), reason="Optional local Delta JARs not configured")
-def test_real_delta_annual_replacement_preserves_other_year(spark, monthly):
+@pytest.mark.parametrize("other_year", [2024, 2026])
+def test_real_delta_annual_replacement_preserves_other_year(spark, monthly, other_year):
     table = "default.year_test_" + uuid.uuid4().hex
     try:
-        L.load_monthly_delta(spark, table, monthly.withColumn("ANIO", F.lit(2024)), 2024, "ALL")
+        L.load_monthly_delta(spark, table, monthly.withColumn("ANIO", F.lit(other_year)), other_year, "ALL")
         annual = monthly.unionByName(monthly.withColumn("MES", F.lit(8)))
         L.load_monthly_delta(spark, table, annual, 2025, "ALL")
-        assert spark.table(table).where("ANIO=2024").count() == 2
+        assert spark.table(table).where(F.col("ANIO") == other_year).count() == 2
         assert spark.table(table).where("ANIO=2025").count() == 4
         # Annual replacement also removes old months absent from the replacement file.
         L.load_monthly_delta(spark, table, monthly, 2025, "ALL")
         assert spark.table(table).where("ANIO=2025 AND MES=8").count() == 0
-        assert spark.table(table).where("ANIO=2024").count() == 2
+        assert spark.table(table).where(F.col("ANIO") == other_year).count() == 2
     finally:
         spark.sql(f"DROP TABLE IF EXISTS {table}")
 

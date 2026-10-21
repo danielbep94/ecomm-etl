@@ -296,7 +296,7 @@ def test_qa_uses_persisted_snapshots_without_incoming(spark, catalogs, monkeypat
     monkeypatch.setattr(M.L, "qa_validation_results", validation_results)
     monkeypatch.setattr(M.E, "list_incoming_files", Mock(side_effect=AssertionError("QA must not read incoming")))
     result = M.run_qa_validation(2025, scope, id_interno="1e0", spark=spark, dbutils=Mock())
-    assert len(result) == 17
+    assert len(result) == 18
     assert result["qa_final_status"].first().STATUS == ("FAIL" if missing_history else "PASS")
     assert result["qa_product_catalog_coverage"].first().MATCHED_PRODUCT_ROWS == (2 if scope == "ALL" else 1)
     joined = result["qa_joined_ecommerce_data"].orderBy("MES").collect()
@@ -304,10 +304,16 @@ def test_qa_uses_persisted_snapshots_without_incoming(spark, catalogs, monkeypat
     assert joined[0].PRODUCT_NOMBRE == "Product" and joined[0].STORE_CADENA == "Chain"
     assert joined[0].PRODUCT_MATCHED and joined[0].STORE_MATCHED
     assert joined[0].MONTO == 10.0
+    summary = result["qa_sales_summary"].orderBy("MES").collect()
+    assert len(summary) == (2 if scope == "ALL" else 1)
+    assert summary[0].ANIO == 2025 and summary[0].MES == 7
+    assert summary[0].CADENA == "Chain" and summary[0].MARCA == "Brand"
+    assert summary[0].UNIDADES == 1.0 and summary[0].VENTAS == 10
     if scope == "ALL":
         assert joined[1].PRODUCT_NOMBRE == "Changed product" and joined[1].STORE_CADENA == "Changed chain"
         assert result["qa_catalog_duplicate_detail"].count() == 0
         assert result["qa_snowflake_star_relationships"].first().STATUS == "PASS"
+        assert summary[1].MES == 8 and summary[1].CADENA == "Changed chain"
     M.E.list_incoming_files.assert_not_called()
 
 

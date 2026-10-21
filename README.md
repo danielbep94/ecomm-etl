@@ -151,6 +151,36 @@ FAIL_ON_QA_ERROR=true. Puede cruzar un año cargado en una sola ejecución o en
 varias cargas mensuales: cada fila usa sus catálogos por RUN_ID y QA comprueba
 que cada RUN_ID tenga tracking SUCCEEDED.
 
+### Cargar 2025 después de 2026
+
+Con 2026 ya cargado, coloca en `incoming` exactamente los tres catálogos y
+`TBL_BI_BQ_FACTS_ECOMM_ONE_DANONE_FULL_2025.csv`, con TIME_ID de 2025. Usa los
+catálogos que correspondan a los productos y tiendas de ese archivo. Edita la
+celda manual del job:
+
+```python
+ANIO = 2025
+MES = "ALL"
+FORCE_REPROCESS = False  # Primera carga de 2025; True para reemplazar un 2025 ya exitoso.
+```
+
+El reemplazo de hechos usa `WHERE ANIO=2025` en Delta y Snowflake y conserva
+2026. Los catálogos añaden un snapshot con RUN_ID nuevo; los hechos 2026 siguen
+uniéndose a sus snapshots originales, aunque cambie el snapshot activo.
+No ejecutes el notebook de reset: ese mantenimiento vacía todos los años.
+Los conteos SOURCE_ROWS/TARGET_ROWS_AFTER del resumen corresponden al periodo
+seleccionado, no al total de todos los años de la tabla.
+
+Después ejecuta QA con ANIO=2025, MES="ALL", RUN_ID=None y los filtros opcionales
+en None. Para revisar 2026 cambia ANIO a 2026. Verifica ambos años en Snowflake:
+
+```sql
+SELECT ANIO, COUNT(*) AS FILAS
+FROM PRD_MDP.MDP_STG.FACT_ECOMMERCE_DANONE
+GROUP BY ANIO
+ORDER BY ANIO;
+```
+
 ## Flujo de e-commerce
 
 El job valida primero los cuatro CSV completos: columnas y tipos, claves
@@ -515,8 +545,8 @@ ID_STORE = None
 
 Los filtros opcionales usan `None` por defecto. Para filtrar, asigna el valor
 a la variable correspondiente. Se pasan a `run_qa_validation` y se muestran
-sus diecisiete DataFrames, empezando por los datos cruzados e incluyendo el estado
-final. Con `FAIL_ON_QA_ERROR=true`, un
+sus dieciocho DataFrames, empezando por los datos cruzados y el resumen mensual,
+e incluyendo el estado final. Con `FAIL_ON_QA_ERROR=True`, un
 estado `FAIL` hace fallar la tarea **después** de mostrar todos los resultados.
 `PASS_WITH_WARNINGS` no falla. Para inspección interactiva puedes ponerlo en
 `False`. El notebook QA no llama al ETL ni modifica tablas o archivos.
@@ -648,13 +678,14 @@ También admite `run_id`. Los resultados son `qa_pipeline_history`,
 `qa_fact_duplicate_summary`, `qa_negative_values`, `qa_join_multiplication_check`,
 `qa_source_delta_reconciliation`, `qa_delta_snowflake_reconciliation`,
 `qa_snowflake_catalog_reconciliation`, `qa_snowflake_star_relationships`,
-`qa_joined_ecommerce_data` y
+`qa_joined_ecommerce_data`, `qa_sales_summary` y
 `qa_final_status` (`PASS`, `PASS_WITH_WARNINGS` o `FAIL`). QA es de solo lectura.
 
 Para consultar los datos cruzados desde Python:
 
 ```python
 display(qa["qa_joined_ecommerce_data"])
+display(qa["qa_sales_summary"])
 ```
 
 El resultado conserva las columnas de la fact y añade `PRODUCT_*`, `STORE_*`,
@@ -666,6 +697,14 @@ Una misma clave en distintos RUN_ID representa versiones históricas y no es un
 duplicado dentro de un snapshot. Los filtros de periodo, BU y IDs también se
 aplican al resultado cruzado. El notebook muestra todos los resultados antes de
 fallar la tarea cuando QA devuelve FAIL.
+
+`qa_sales_summary` tiene exactamente `ANIO, MES, CADENA, MARCA, UNIDADES, VENTAS`.
+Agrupa los datos Snowflake cruzados por año/mes/cadena/marca con sus catálogos del
+mismo RUN_ID. UNIDADES es SUM(UNIDADES), VENTAS es SUM(MONTO) con Decimal(38,6).
+Incluye devoluciones con su signo original; los NULL no aportan al SUM y un grupo
+sin valores numéricos conserva NULL. Respeta el periodo y los filtros QA actuales.
+Se muestra como segunda salida y también queda en la variable `qa_sales_summary`
+del notebook. Es solo un DataFrame de consulta, sin escribir tablas de negocio.
 
 Staging y curated conservan la última versión de cada periodo. Tras un reproceso,
 consultar QA de un RUN_ID reemplazado no reconstruye su antigua fact: mostrará

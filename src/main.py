@@ -657,6 +657,7 @@ def run_qa_validation(
         "qa_snowflake_catalog_reconciliation": catalog_qa,
         "qa_snowflake_star_relationships": star_qa,
         "qa_joined_ecommerce_data": joined_data,
+        "qa_sales_summary": V.qa_sales_summary(joined_data),
         "qa_final_status": spark.createDataFrame(
             [(anio, None if mes == "ALL" else mes, effective_run_id, status)],
             "ANIO int, MES int, RUN_ID string, STATUS string",
