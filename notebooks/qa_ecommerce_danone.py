@@ -1,6 +1,8 @@
 # Databricks notebook source
 # MAGIC %md
 # MAGIC # E-commerce — QA persistido
+# MAGIC Usa `MES=ALL` para reemplazar el año seleccionado completo; `MES=1`–`12` carga un mes.
+# MAGIC MES vacío es inválido. Usa el mismo ANIO/MES de la carga para consultar sus datos.
 # MAGIC Define `ANIO` y `MES`; los filtros opcionales vacíos consultan el periodo completo.
 # MAGIC Este notebook lee Delta y Snowflake sin consultar `incoming` ni ejecutar cargas.
 # MAGIC `FAIL_ON_QA_ERROR=true` hace fallar la tarea después de mostrar los hallazgos

@@ -1,9 +1,41 @@
 # E-commerce — Databricks / Snowflake
 
-ETL mensual en Python y PySpark para cuatro CSV de e-commerce. Valida el lote
-completo, conserva snapshots de catálogos, reemplaza un solo periodo en Delta y
+ETL por mes o año completo en Python y PySpark para cuatro CSV de e-commerce. Valida el lote
+completo, conserva snapshots de catálogos, reemplaza el periodo seleccionado en Delta y
 Snowflake, registra el resultado terminal y permite consultar QA sin los archivos
 originales. El código de producción está en los ocho módulos solicitados.
+
+## Archivo anual: MES=ALL
+
+Un archivo `...FULL_2026.csv` puede incluir los doce meses. Configura los widgets
+así para cargar el año en una sola ejecución:
+
+```json
+{"ANIO":"2026", "MES":"ALL", "FORCE_REPROCESS":"false"}
+```
+
+`MES=ALL` carga todos los registros válidos del año y reemplaza **todo ANIO=2026**
+en Delta y Snowflake, conservando el MES real de cada registro. Si el archivo
+solo tiene algunos meses, los meses anteriores de ese año ausentes del archivo
+se eliminan del destino: usa esta opción con el archivo anual completo que
+quieras dejar publicado. No exige que existan doce meses; admite años parciales.
+Otros años quedan fuera del reemplazo. Un error invalida el lote completo;
+no se confirman meses uno por uno en Snowflake.
+
+`MES=1`–`12` continúa cargando solo el mes elegido. MES vacío sigue siendo
+inválido: escribe ALL explícitamente para seleccionar el reemplazo anual. No
+se interpreta vacío ni 0 como una orden de reemplazar un año.
+
+Si ya existe una carga exitosa que se solapa con el periodo, usa
+`FORCE_REPROCESS=true`: una carga anual se solapa con cualquier carga mensual de
+ese año; una mensual se solapa con una carga anual previa. El tracker anual usa
+1 de enero–31 de diciembre. Catálogos y validaciones anuales usan MES=NULL; las
+filas de ventas mantienen MES entre 1 y 12.
+
+Para consultar el año, ejecuta el notebook QA con ANIO=2026, MES=ALL y
+FAIL_ON_QA_ERROR=true. Puede cruzar un año cargado en una sola ejecución o en
+varias cargas mensuales: cada fila usa sus catálogos por RUN_ID y QA comprueba
+que cada RUN_ID tenga tracking SUCCEEDED.
 
 ## Flujo de e-commerce
 
@@ -16,7 +48,7 @@ copias idénticas como atributos conflictivos hacen fallar el lote; no se elimin
 duplicados automáticamente ni se permite bajar su severidad a advertencia.
 
 Tras pasar la validación, se persisten las tablas Delta y se concilia staging
-Snowflake. Los tres MERGE de catálogos y el reemplazo mensual de la fact se
+Snowflake. Los tres MERGE de catálogos y el reemplazo del periodo de la fact se
 confirman en **una transacción Snowflake** solamente si las conciliaciones y los
 joins pasan. Un fallo dentro de esa transacción revierte los cuatro cambios.
 Los commits de Delta, la creación de tablas, DBFS y el tracker son independientes.
@@ -36,9 +68,9 @@ No depende de los CSV ni ejecuta una nueva carga.
 3. Opcionalmente ejecuta [el SQL de creación](conf/snowflake_business_tables.sql)
    en Snowflake. El ETL también crea las cuatro tablas si faltan.
 4. Abre `notebooks/job_ecommerce_danone.py`, configura `ANIO=2026`, `MES` con el
-   mes que quieres cargar (1–12, presente en el archivo) y
+   mes que quieres cargar (1–12, presente en el archivo), o ALL para el año, y
    `FORCE_REPROCESS=false`, y ejecuta todas las celdas. El archivo anual se
-   valida completo, pero solo se carga el mes seleccionado.
+   valida completo; se carga el mes seleccionado o todo el año con ALL.
 5. Ejecuta `notebooks/qa_ecommerce_danone.py` con el mismo ANIO/MES y
    `FAIL_ON_QA_ERROR=true`. Comprueba `qa_final_status` y los resultados de
    conciliación y joins. Un reproceso de un mes ya exitoso requiere volver a
@@ -66,7 +98,7 @@ No depende de los CSV ni ejecuta una nueva carga.
   Ningún otro job debe escribir estos destinos simultáneamente. Las huellas y la
   metadata detectan modificaciones de archivos durante el procesamiento.
 - Un lote con errores de validación no modifica tablas de negocio. Delta realiza
-  commits independientes por tabla; Snowflake realiza su propio commit mensual.
+  commits independientes por tabla; Snowflake realiza su propio commit del mes o año seleccionado.
   **No existe una transacción distribuida entre Delta, Snowflake y DBFS.** Una
   falla técnica posterior puede dejar cambios ya confirmados; el reintento del
   periodo los sustituye de forma idempotente.
@@ -238,7 +270,7 @@ Sincroniza `main` antes de ejecutar. Se admite
 Con los cuatro CSV en `dbfs:/FileStore/tables/ecomm_dph/incoming`, abre
 `notebooks/job_ecommerce_danone.py` y configura ANIO=2026, MES=un mes que exista
 en el archivo anual, FORCE_REPROCESS=false. Por ejemplo, MES=7 procesa julio
-solo si hay registros de julio. El job no carga todos los meses a la vez.
+solo si hay registros de julio. Para cargar todos los meses, usa MES=ALL.
 
 Antes de empezar conserva tus originales: en un fallo se elimina el lote enviado
 de `incoming`; en éxito se mueve a `current`. Para procesar otro mes o reintentar,
@@ -362,7 +394,7 @@ nulos, intento 0 y trigger `INTERACTIVE`.
 8. Después de validar todo, activa snapshots de catálogos con un MERGE Delta por
    catálogo. El mismo commit desactiva el snapshot anterior e inserta el nuevo;
    se preserva historia con RUN_ID, IS_ACTIVE y vigencias UTC.
-9. Escribe staging y curated solo para ANIO/MES mediante `replaceWhere`. Curated
+9. Escribe staging y curated solo para el periodo mediante `replaceWhere` (ANIO/MES o solo ANIO con ALL). Curated
    conserva las columnas fuente, NORMALIZED_BU, atributos `PRODUCT_*`, atributos
    `STORE_*` y metadata operacional. Se conserva el grano de la fact fuente.
 10. Concilia filas, MONTO y registros entre fuente transformada y Delta.
@@ -370,7 +402,7 @@ nulos, intento 0 y trigger `INTERACTIVE`.
     con sufijo RUN_ID. Proyecta la fact a sus 16 columnas sin descripciones y
     copia la historia completa de catálogos desde Delta. Después de conciliar
     staging, en **una misma conexión Python** ejecuta BEGIN, tres MERGE por
-    RUN_ID + ID, DELETE/INSERT del periodo de la fact, conciliación de las cuatro
+    RUN_ID + ID, DELETE/INSERT del periodo de la fact (ANIO/MES o ANIO con ALL), conciliación de las cuatro
     tablas, validación de joins históricos y COMMIT. Ante error intenta ROLLBACK.
     El DDL ocurre fuera de la transacción. No se borra historia de catálogos.
 12. Comprueba también el resultado ya confirmado desde Spark. Solo entonces
@@ -461,11 +493,11 @@ duplicado dentro de un snapshot. Los filtros de periodo, BU y IDs también se
 aplican al resultado cruzado. El notebook muestra todos los resultados antes de
 fallar la tarea cuando QA devuelve FAIL.
 
-Staging y curated conservan la última versión de cada mes. Tras un reproceso,
+Staging y curated conservan la última versión de cada periodo. Tras un reproceso,
 consultar QA de un RUN_ID reemplazado no reconstruye su antigua fact: mostrará
 FAIL si ya no existe esa versión. Catálogos, hallazgos e historial sí conservan
 la auditoría por intento. La detección anual original se consulta en el JSON del
-tracker; la detección de QA corresponde a los registros mensuales persistidos.
+tracker; la detección de QA corresponde a los registros persistidos del periodo elegido.
 
 ## Pruebas locales opcionales
 
@@ -487,19 +519,22 @@ Las transacciones Snowflake se prueban con un doble de conexión; no ejecutan SQ
 contra la cuenta real. La validación integral de conectores, permisos y servicios
 corresponde a la prueba posterior en tu workspace Databricks.
 
-Las tres pruebas de integración con escritura real en Delta son opcionales: configura
+Los cinco casos de integración con escritura real en Delta son opcionales: configura
 `ECOMM_TEST_DELTA_JARS` con las rutas de los JARs oficiales de Delta Spark y Delta
 Storage, separadas por coma, e instala el paquete Python `delta-spark` compatible.
-Sin esa variable se omiten explícitamente esas tres pruebas. En la validación de
+Sin esa variable se omiten explícitamente esos cinco casos. En la validación de
 este desarrollo se ejecutaron con Spark 4.0.4, Delta 4.0.1, Python 3.12 y Java 21;
 los JARs se descargaron de Maven Central y se verificaron sus digests publicados.
 
 ### Validación realizada
 
-La suite completa terminó con **97 pruebas aprobadas, 0 fallos y 0 omitidas**.
+La suite completa terminó con **112 pruebas aprobadas, 0 fallos y 0 omitidas**.
 Las pruebas locales usan Python 3.12, Spark 4.0.4 y Delta Lake 4.0.1 e incluyen
 un lote completo de cuatro CSV con cargas Delta y movimientos locales de archivos
 reales. La suite también comprueba creación de las cuatro tablas, rechazo de
 esquemas incompatibles, rollback de cambios en catálogos/fact, joins históricos
 sin multiplicación y los dos notebooks. Snowflake se ejercita con dobles de
 conexión; la ejecución integral en tu Databricks/Snowflake está pendiente.
+
+Además se aprobaron tres escenarios QA adicionales: un mes, un año con distintas
+versiones de catálogo por mes y la detección de un RUN_ID sin tracking exitoso.

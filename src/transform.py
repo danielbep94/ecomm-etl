@@ -1,5 +1,7 @@
 """Pure Spark validation, transformations and persisted-data QA; no table writes."""
 
+import calendar
+import datetime as dt
 import math
 import re
 from decimal import Decimal, InvalidOperation
@@ -57,7 +59,7 @@ ERROR_TYPES = {
 
 class ValidationReport:
     def __init__(self, spark, run_id, anio=None, mes=None):
-        self.spark, self.run_id, self.anio, self.mes = spark, run_id, anio, mes
+        self.spark, self.run_id, self.anio, self.mes = spark, run_id, anio, None if mes == "ALL" else mes
         self.records, self.detail_frames = [], []
         self.persisted = False
 
@@ -173,15 +175,18 @@ class ValidationReport:
 def validate_parameters(anio, mes, force_reprocess=False):
     if isinstance(anio, bool) or not re.fullmatch(r"[1-9]\d{3}", str(anio).strip()):
         raise ValidationError("ANIO must be a four-digit integer.", "PERIOD_VALIDATION_ERROR")
-    if isinstance(mes, bool) or not re.fullmatch(r"\d{1,2}", str(mes).strip()) or not 1 <= int(mes) <= 12:
-        raise ValidationError("MES must be an integer between 1 and 12.", "PERIOD_VALIDATION_ERROR")
+    annual = str(mes).strip().upper() == "ALL"
+    if not annual and (
+        isinstance(mes, bool) or not re.fullmatch(r"\d{1,2}", str(mes).strip()) or not 1 <= int(mes) <= 12
+    ):
+        raise ValidationError("MES must be 1–12, or ALL to replace the selected year.", "PERIOD_VALIDATION_ERROR")
     if isinstance(force_reprocess, bool):
         force = force_reprocess
     elif str(force_reprocess).strip().lower() in {"true", "false"}:
         force = str(force_reprocess).strip().lower() == "true"
     else:
         raise ValidationError("FORCE_REPROCESS must be true or false.", "PERIOD_VALIDATION_ERROR")
-    return int(anio), int(mes), force
+    return int(anio), "ALL" if annual else int(mes), force
 
 
 def validate_headers(headers, expected, report, dataset, source):
@@ -393,11 +398,14 @@ def validate_catalog_duplicates(frame, dataset, report, source=None):
 
 def cross_catalog_collisions(edp, waters, key):
     left, right = edp.alias("e"), waters.alias("w")
+    condition = F.col("e." + key) == F.col("w." + key)
+    if "RUN_ID" in edp.columns and "RUN_ID" in waters.columns:
+        condition = condition & (F.col("e.RUN_ID") == F.col("w.RUN_ID"))
     same = reduce(
         lambda a, b: a & b, [F.col("e." + c).eqNullSafe(F.col("w." + c)) for c in C.PRODUCT_COMPARISON_COLUMNS]
     )
     return (
-        left.join(right, F.col("e." + key) == F.col("w." + key), "inner")
+        left.join(right, condition, "inner")
         .select(
             F.col("e." + key).alias(key),
             F.when(same, "CROSS_CATALOG_SAME_PRODUCT")
@@ -483,7 +491,7 @@ def detect_fact_period(frame, anio, mes, report, source=None):
         source=source,
         sample=_sample(dated.where(F.col("NORMALIZED_BU").isNull()), ["BU"]) if unknown else None,
     )
-    monthly = dated.where((F.col("ANIO") == anio) & (F.col("MES") == mes)).drop("_TIME_TEXT", "_TIME_ISO", "_TIME_DATE")
+    monthly = period_filter(dated, anio, mes).drop("_TIME_TEXT", "_TIME_ISO", "_TIME_DATE")
     count = monthly.count()
     report.add("ECOMMERCE_FACT", "REQUESTED_PERIOD_EXISTS", int(count == 0), category="PERIOD", source=source)
     bounds = (
@@ -497,6 +505,7 @@ def detect_fact_period(frame, anio, mes, report, source=None):
     )
     return monthly, {
         **bounds,
+        "LOAD_SCOPE": "YEAR" if mes == "ALL" else "MONTH",
         "REQUESTED_PERIOD_ROWS": count,
         "OTHER_PERIOD_ROWS": bounds["SOURCE_ANNUAL_ROWS"] - count - invalid,
         "INVALID_TIME_ID_ROWS": invalid,
@@ -661,8 +670,10 @@ def add_operational_metadata(frame, metadata, anio, mes, catalog_bu=None, timest
         "SOURCE_FILE_YEAR": metadata["FILE_YEAR"],
         "LOAD_TIMESTAMP_UTC": timestamp or utc_now(),
         "ANIO": anio,
-        "MES": mes,
+        "MES": None if mes == "ALL" else mes,
     }
+    if mes == "ALL" and "MES" in frame.columns:
+        del values["MES"]  # Fact rows keep their actual TIME_ID-derived month.
     if catalog_bu:
         values["CATALOG_BU"] = catalog_bu
     for key, value in values.items():
@@ -677,8 +688,23 @@ def add_operational_metadata(frame, metadata, anio, mes, catalog_bu=None, timest
     return frame
 
 
+def period_bounds(anio, mes):
+    if mes == "ALL":
+        return dt.date(anio, 1, 1), dt.date(anio, 12, 31)
+    return dt.date(anio, mes, 1), dt.date(anio, mes, calendar.monthrange(anio, mes)[1])
+
+
+def period_predicate(anio, mes, spaced=False):
+    eq = " = " if spaced else "="
+    year = f"ANIO{eq}{int(anio)}"
+    return year if mes == "ALL" else f"{year} AND MES{eq}{int(mes)}"
+
+
 def period_filter(frame, anio, mes):
-    return frame.where((F.col("ANIO") == anio) & (F.col("MES") == mes))
+    predicate = F.col("ANIO") == anio
+    if mes != "ALL":
+        predicate = predicate & (F.col("MES") == mes)
+    return frame.where(predicate)
 
 
 def apply_qa_filters(frame, run_id=None, logical_dataset=None, bu=None, id_interno=None, id_store=None):
@@ -703,6 +729,7 @@ def qa_catalog_duplicate_detail(edp, waters, stores):
     ]:
         key_sets = [[k] for k in keys] + ([["ID_INTERNO", "SKU"]] if dataset != "STORE_CATALOG" else [])
         for key_set in key_sets:
+            key_set = (["RUN_ID"] if "RUN_ID" in frame.columns else []) + key_set
             grouped = duplicate_groups(frame, key_set, C.SOURCE_DEFINITIONS[dataset][0])
             frames.append(
                 grouped.select(
@@ -748,12 +775,18 @@ def versioned_coverage_metrics(fact, edp, waters, stores):
     n = fact.count()
     after_product = fact.join(products, product_keys, "left")
     after_store = after_product.join(stores.select(*store_keys), store_keys, "left")
+    unmatched_product = fact.join(products, product_keys, "left_anti").count()
+    unmatched_store = fact.join(stores.select(*store_keys), store_keys, "left_anti").count()
     return {
         "FACT_ROWS": n,
+        "MATCHED_PRODUCT_ROWS": n - unmatched_product,
+        "MATCHED_STORE_ROWS": n - unmatched_store,
+        "PRODUCT_MATCH_PERCENTAGE": 100.0 * (n - unmatched_product) / n if n else 0.0,
+        "STORE_MATCH_PERCENTAGE": 100.0 * (n - unmatched_store) / n if n else 0.0,
         "ROWS_AFTER_PRODUCT_JOIN": after_product.count(),
         "ROWS_AFTER_STORE_JOIN": after_store.count(),
-        "UNMATCHED_PRODUCT_ROWS": fact.join(products, product_keys, "left_anti").count(),
-        "UNMATCHED_STORE_ROWS": fact.join(stores.select(*store_keys), store_keys, "left_anti").count(),
+        "UNMATCHED_PRODUCT_ROWS": unmatched_product,
+        "UNMATCHED_STORE_ROWS": unmatched_store,
         "UNKNOWN_BU_ROWS": fact.where(
             F.col("NORMALIZED_BU").isNull() | ~F.col("NORMALIZED_BU").isin("EDP", "WATERS")
         ).count(),

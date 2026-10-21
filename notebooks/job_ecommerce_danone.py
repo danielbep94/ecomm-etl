@@ -1,6 +1,8 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # E-commerce — job mensual
+# MAGIC # E-commerce — job por mes o año
+# MAGIC Usa `MES=ALL` para reemplazar el año seleccionado completo; `MES=1`–`12` carga un mes.
+# MAGIC MES vacío es inválido. Para repetir un periodo exitoso, usa FORCE_REPROCESS=true.
 # MAGIC Define `ANIO`, `MES` y `FORCE_REPROCESS` antes de ejecutar todas las celdas.
 # MAGIC El cómputo necesita las dependencias del proyecto, el conector Spark de
 # MAGIC Snowflake y acceso al scope documentado en README. No se instalan librerías
@@ -80,7 +82,7 @@ display(
                 run_record["RUN_ID"],
                 run_record["STATUS"],
                 ANIO,
-                MES,
+                None if MES == "ALL" else MES,
                 run_record["SOURCE_ROWS"],
                 run_record["STAGING_ROWS"],
                 run_record["TRANSFORMED_ROWS"],

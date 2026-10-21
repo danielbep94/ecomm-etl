@@ -1,11 +1,11 @@
-"""Non-secret configuration for the monthly e-commerce pipeline."""
+"""Non-secret configuration for the month/year e-commerce pipeline."""
 
 SCHEMA_NAME = "ecomm_dph"
 BASE_PATH = f"dbfs:/FileStore/tables/{SCHEMA_NAME}"
 INCOMING_PATH = f"{BASE_PATH}/incoming"
 CURRENT_PATH = f"{BASE_PATH}/current"
 PIPELINE_NAME = "ecommerce_danone"
-PIPELINE_VERSION = "2.1.0"
+PIPELINE_VERSION = "2.2.0"
 PIPELINE_ENVIRONMENT = "PROD"
 PIPELINE_SOURCE_NAME = "DBFS_MONTHLY_CSV"
 EXPECTED_FILE_COUNT = 4

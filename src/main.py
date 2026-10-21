@@ -1,7 +1,5 @@
-"""Monthly ETL entry point and read-only persisted-data QA for Databricks."""
+"""Month/year ETL entry point and read-only persisted-data QA for Databricks."""
 
-import calendar
-import datetime as dt
 import os
 import sys
 from pathlib import Path
@@ -195,11 +193,10 @@ def run_pipeline(anio, mes, force_reprocess=False, *, spark=None, dbutils=None):
     stage = "PARAMETERS"
     try:
         anio, mes, force_reprocess = V.validate_parameters(anio, mes, force_reprocess)
-        report.anio, report.mes = anio, mes
+        report.anio, report.mes = anio, None if mes == "ALL" else mes
         logger.extra.update(ANIO=anio, MES=mes)
         business_metrics.update(anio=anio, mes=mes, force_reprocess=force_reprocess)
-        period_start_date = dt.date(anio, mes, 1)
-        period_end_date = dt.date(anio, mes, calendar.monthrange(anio, mes)[1])
+        period_start_date, period_end_date = V.period_bounds(anio, mes)
         logger.event(stage, "PASSED")
         stage = "RUNTIME"
         L.verify_hive_objects(spark)
@@ -519,6 +516,7 @@ def run_qa_validation(
     id_interno = int(V.parse_numeric(id_interno, "int64")[0]) if id_interno is not None else None
     id_store = int(V.parse_numeric(id_store, "int64")[0]) if id_store is not None else None
     source = V.period_filter(spark.table(C.FACT_STAGING_TABLE), anio, mes)
+    source = V.apply_qa_filters(source, run_id=run_id)
     run_ids = source.select("RUN_ID").distinct()
     effective_run_id = run_id
     if not effective_run_id:
@@ -536,21 +534,23 @@ def run_qa_validation(
         edp, waters = [frame.where(F.col("ID_INTERNO") == id_interno) for frame in (edp, waters)]
     if id_store is not None:
         stores = stores.where(F.col("ID_STORE") == id_store)
-    expected_delta = V.enrich_fact(source, edp, waters, stores)
+    expected_delta = V.join_star_fact(source, edp, waters, stores).drop("PRODUCT_MATCHED", "STORE_MATCHED")
     star_delta = V.star_fact(delta)
     sf = L.snowflake_read(
         spark,
         options,
-        f"SELECT {','.join(star_delta.columns)} FROM {C.TARGET_SNOWFLAKE_TABLE} WHERE ANIO={anio} AND MES={mes}",
+        f"SELECT {','.join(star_delta.columns)} FROM {C.TARGET_SNOWFLAKE_TABLE} WHERE {V.period_predicate(anio, mes)}",
     )
     sf = V.apply_qa_filters(sf, **filters)
     history = L.read_pipeline_history(spark, options, anio, mes, effective_run_id)
     findings = L.qa_validation_results(spark, anio, mes, effective_run_id, logical_dataset)
+    if mes == "ALL" and not effective_run_id:
+        findings = findings.join(run_ids, "RUN_ID", "inner")
     duplicate_detail = V.qa_catalog_duplicate_detail(edp, waters, stores)
     if logical_dataset:
         duplicate_detail = duplicate_detail.where(F.col("LOGICAL_DATASET") == logical_dataset)
     collisions = V.qa_cross_catalog_collisions(edp, waters)
-    coverage = V.coverage_metrics(source, edp, waters, stores)
+    coverage = V.versioned_coverage_metrics(source, edp, waters, stores)
     period_report = V.ValidationReport(spark, effective_run_id or "QA", anio, mes)
     _, detection = V.detect_fact_period(source.select(*C.FACT_EXPECTED_COLUMNS), anio, mes, period_report)
     fact_duplicates = V.duplicate_groups(
@@ -590,7 +590,7 @@ def run_qa_validation(
         sf, remote_catalogs["EDP_CATALOG"], remote_catalogs["WATERS_CATALOG"], remote_catalogs["STORE_CATALOG"]
     )
     failed = (
-        not effective_run_id
+        (mes != "ALL" and not effective_run_id)
         or source.count() == 0
         or period_report.failed
         or source_delta.first().STATUS == "FAIL"
@@ -604,7 +604,12 @@ def run_qa_validation(
         or (C.CROSS_CATALOG_COLLISION_SEVERITY == "ERROR" and collisions.limit(1).count() > 0)
         or (C.FACT_BUSINESS_KEY_DUPLICATE_SEVERITY == "ERROR" and fact_duplicates.limit(1).count() > 0)
         or findings.where(F.col("VALIDATION_STATUS") == "FAIL").limit(1).count() > 0
-        or history.where(F.col("STATUS") == "SUCCEEDED").limit(1).count() == 0
+        or source.select("RUN_ID")
+        .distinct()
+        .join(history.where(F.col("STATUS") == "SUCCEEDED").select("RUN_ID").distinct(), "RUN_ID", "left_anti")
+        .limit(1)
+        .count()
+        > 0
     )
     warnings = (
         findings.where(F.col("VALIDATION_STATUS") == "WARNING").limit(1).count() > 0
@@ -639,7 +644,8 @@ def run_qa_validation(
         "qa_snowflake_star_relationships": star_qa,
         "qa_joined_ecommerce_data": joined_data,
         "qa_final_status": spark.createDataFrame(
-            [(anio, mes, effective_run_id, status)], "ANIO int, MES int, RUN_ID string, STATUS string"
+            [(anio, None if mes == "ALL" else mes, effective_run_id, status)],
+            "ANIO int, MES int, RUN_ID string, STATUS string",
         ),
     }
 
@@ -647,7 +653,7 @@ def run_qa_validation(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Monthly e-commerce ETL for Databricks")
+    parser = argparse.ArgumentParser(description="E-commerce month/year ETL for Databricks")
     parser.add_argument("--anio", "--ANIO", dest="anio", required=True)
     parser.add_argument("--mes", "--MES", dest="mes", required=True)
     parser.add_argument("--force-reprocess", "--FORCE_REPROCESS", dest="force_reprocess", default="false")

@@ -135,17 +135,23 @@ class Cursor:
 
 
 @pytest.mark.parametrize(
-    "fail",
+    "scope,fail",
     [
-        None,
-        "INSERT",
-        "MERGE INTO PRD_MDP.MDP_STG.CATALOG_WATERS",
-        "relationships",
-        "CREATE TRANSIENT TABLE PRD_MDP.MDP_STG.CATALOG_WATERS",
+        (7, None),
+        (7, "INSERT"),
+        (7, "MERGE INTO PRD_MDP.MDP_STG.CATALOG_WATERS"),
+        (7, "relationships"),
+        (7, "CREATE TRANSIENT TABLE PRD_MDP.MDP_STG.CATALOG_WATERS"),
+        ("ALL", None),
+        ("ALL", "INSERT"),
     ],
 )
-def test_snowflake_transaction_and_rollback(spark, star_payloads, monkeypatch, fail):
+def test_snowflake_transaction_and_rollback(spark, star_payloads, monkeypatch, fail, scope):
     fact, catalogs, run_id = star_payloads
+    if scope == "ALL":
+        fact = fact.withColumn("MES", F.when(F.col("NORMALIZED_BU") == "WATERS", 8).otherwise(7)).withColumn(
+            "TIME_ID", F.when(F.col("NORMALIZED_BU") == "WATERS", F.lit(202508)).otherwise(F.col("TIME_ID"))
+        )
     payloads = {C.SNOWFLAKE_CATALOG_TABLES[k]: v for k, v in catalogs.items()}
     payloads[C.TARGET_SNOWFLAKE_TABLE] = fact
     cursor = Cursor(payloads, fail)
@@ -173,10 +179,10 @@ def test_snowflake_transaction_and_rollback(spark, star_payloads, monkeypatch, f
     observed = {}
     if fail:
         with pytest.raises(PipelineError) as captured:
-            L.load_snowflake_period(spark, {}, fact, 2025, 7, run_id, observed, catalogs)
+            L.load_snowflake_period(spark, {}, fact, 2025, scope, run_id, observed, catalogs)
         assert "private" not in str(captured.value)
     else:
-        result = L.load_snowflake_period(spark, {}, fact, 2025, 7, run_id, observed, catalogs)
+        result = L.load_snowflake_period(spark, {}, fact, 2025, scope, run_id, observed, catalogs)
         assert result["reconciliation_status"] == "PASS"
         assert len(result["catalog_metrics"]) == 3
         assert result["star_relationships"]["status"] == "PASS"
@@ -199,7 +205,14 @@ def test_snowflake_transaction_and_rollback(spark, star_payloads, monkeypatch, f
     transaction = transaction[: next(i for i, sql in enumerate(transaction) if sql in {"COMMIT", "ROLLBACK"})]
     assert not any(sql.startswith(("CREATE", "ALTER", "DROP")) for sql in transaction)
     assert all("RUN_ID=s.RUN_ID" in sql for sql in transaction if sql.startswith("MERGE"))
-    assert all("WHERE ANIO=2025 AND MES=7" in sql and "FACT_" in sql for sql in transaction if sql.startswith("DELETE"))
+    delete = (
+        next(sql for sql in transaction if sql.startswith("DELETE"))
+        if not (fail and fail.startswith("MERGE"))
+        else None
+    )
+    if delete:
+        expected_where = "WHERE ANIO=2025" if scope == "ALL" else "WHERE ANIO=2025 AND MES=7"
+        assert delete.endswith(expected_where) and "FACT_" in delete
     assert observed["remaining_staging_tables"] == []
 
 
@@ -374,3 +387,29 @@ def test_qa_join_keeps_sales_with_missing_or_duplicated_catalog_keys(star_payloa
         .STATUS
         == "FAIL"
     )
+
+
+def test_tracking_overlap_queries_protect_months_and_years(spark, monkeypatch):
+    queries = []
+    monkeypatch.setattr(L, "snowflake_read", lambda _, options, query: queries.append(query))
+    L.read_pipeline_history(spark, {}, 2026, "ALL")
+    L.read_pipeline_history(spark, {}, 2026, 7)
+    assert "PERIOD_START_DATE<='2026-12-31'" in queries[0] and "PERIOD_END_DATE>='2026-01-01'" in queries[0]
+    assert "PERIOD_START_DATE<='2026-07-31'" in queries[1] and "PERIOD_END_DATE>='2026-07-01'" in queries[1]
+
+
+@pytest.mark.skipif(not os.environ.get("ECOMM_TEST_DELTA_JARS"), reason="Optional local Delta JARs not configured")
+def test_real_delta_annual_replacement_preserves_other_year(spark, monthly):
+    table = "default.year_test_" + uuid.uuid4().hex
+    try:
+        L.load_monthly_delta(spark, table, monthly.withColumn("ANIO", F.lit(2024)), 2024, "ALL")
+        annual = monthly.unionByName(monthly.withColumn("MES", F.lit(8)))
+        L.load_monthly_delta(spark, table, annual, 2025, "ALL")
+        assert spark.table(table).where("ANIO=2024").count() == 2
+        assert spark.table(table).where("ANIO=2025").count() == 4
+        # Annual replacement also removes old months absent from the replacement file.
+        L.load_monthly_delta(spark, table, monthly, 2025, "ALL")
+        assert spark.table(table).where("ANIO=2025 AND MES=8").count() == 0
+        assert spark.table(table).where("ANIO=2024").count() == 2
+    finally:
+        spark.sql(f"DROP TABLE IF EXISTS {table}")

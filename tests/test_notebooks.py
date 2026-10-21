@@ -38,7 +38,8 @@ def execute_notebook(name, values, *, path=None):
     return runtime
 
 
-def test_job_passes_boolean_parameters_and_displays_summary(monkeypatch):
+@pytest.mark.parametrize("scope", ["7", "ALL"])
+def test_job_passes_boolean_parameters_and_displays_summary(monkeypatch, scope):
     run = Mock(
         return_value={
             "RUN_ID": "run-1",
@@ -51,8 +52,8 @@ def test_job_passes_boolean_parameters_and_displays_summary(monkeypatch):
         }
     )
     monkeypatch.setattr(M, "run_pipeline", run)
-    runtime = execute_notebook("job_ecommerce_danone.py", {"ANIO": "2025", "MES": "7", "FORCE_REPROCESS": "false"})
-    assert run.call_args.args == (2025, 7, False)
+    runtime = execute_notebook("job_ecommerce_danone.py", {"ANIO": "2025", "MES": scope, "FORCE_REPROCESS": "false"})
+    assert run.call_args.args == (2025, "ALL" if scope == "ALL" else 7, False)
     assert run.call_args.kwargs == {"spark": runtime["spark"], "dbutils": runtime["dbutils"]}
     run.assert_called_once()
     runtime["display"].assert_called_once()

@@ -176,7 +176,8 @@ def test_cleanup_failure_does_not_replace_original_error(pipeline, monkeypatch):
     pipeline["tracking"].assert_called_once()
 
 
-def test_qa_uses_persisted_snapshots_without_incoming(spark, catalogs, monkeypatch):
+@pytest.mark.parametrize("scope,missing_history", [(7, False), ("ALL", False), ("ALL", True)])
+def test_qa_uses_persisted_snapshots_without_incoming(spark, catalogs, monkeypatch, scope, missing_history):
     from src import transform as V
     from src.run_tracking import utc_now
 
@@ -197,12 +198,26 @@ def test_qa_uses_persisted_snapshots_without_incoming(spark, catalogs, monkeypat
     source = V.add_operational_metadata(V.normalize_bu(source), metadata, 2025, 7, timestamp=utc_now())
     from pyspark.sql import functions as F
 
+    second_id = "22222222-2222-2222-2222-222222222222"
+    second = (
+        source.withColumn("TIME_ID", F.lit(202508).cast("long"))
+        .withColumn("MES", F.lit(8))
+        .withColumn("RUN_ID", F.lit(second_id))
+    )
+    changed_product = edp.withColumn("NOMBRE", F.lit("Changed product"))
+    changed_store = stores.withColumn("CADENA", F.lit("Changed chain"))
+
+    def versions(first, second):
+        return first.withColumn("RUN_ID", F.lit(run_id)).unionByName(second.withColumn("RUN_ID", F.lit(second_id)))
+
     tables = {
-        C.FACT_STAGING_TABLE: source,
-        C.FACT_CURATED_TABLE: V.enrich_fact(source, edp, waters, stores),
-        C.CATALOG_EDP_TABLE: edp.withColumn("RUN_ID", F.lit(run_id)),
-        C.CATALOG_WATERS_TABLE: waters.withColumn("RUN_ID", F.lit(run_id)),
-        C.CATALOG_STORE_TABLE: stores.withColumn("RUN_ID", F.lit(run_id)),
+        C.FACT_STAGING_TABLE: source.unionByName(second),
+        C.FACT_CURATED_TABLE: V.enrich_fact(source, edp, waters, stores).unionByName(
+            V.enrich_fact(second, changed_product, waters, changed_store)
+        ),
+        C.CATALOG_EDP_TABLE: versions(edp, changed_product),
+        C.CATALOG_WATERS_TABLE: versions(waters, waters),
+        C.CATALOG_STORE_TABLE: versions(stores, changed_store),
     }
     monkeypatch.setattr(spark, "table", lambda name: tables[name])
     monkeypatch.setattr(M.L, "verify_hive_objects", lambda spark: spark.conf.set("spark.sql.session.timeZone", "UTC"))
@@ -220,32 +235,48 @@ def test_qa_uses_persisted_snapshots_without_incoming(spark, catalogs, monkeypat
                 ]
             },
         }
-        return next(frame for table, frame in remote.items() if "FROM " + table in query)
+        frame = next(frame for table, frame in remote.items() if "FROM " + table in query)
+        return frame.where(F.expr(query.split(" WHERE ", 1)[1])) if " WHERE " in query else frame
 
     monkeypatch.setattr(M.L, "snowflake_read", snowflake_read)
     monkeypatch.setattr(
-        M.L, "read_pipeline_history", lambda *args: spark.createDataFrame([("SUCCEEDED",)], "STATUS string")
+        M.L,
+        "read_pipeline_history",
+        lambda *args: spark.createDataFrame(
+            [(run_id, "SUCCEEDED")] + ([] if missing_history else [(second_id, "SUCCEEDED")]),
+            "RUN_ID string, STATUS string",
+        ),
     )
-    monkeypatch.setattr(
-        M.L, "qa_validation_results", lambda *args: spark.createDataFrame([("PASS",)], "VALIDATION_STATUS string")
-    )
+
+    def validation_results(_, anio, mes, selected_run=None, logical_dataset=None):
+        frame = spark.createDataFrame(
+            [(run_id, "PASS"), (second_id, "PASS"), ("superseded", "FAIL")], "RUN_ID string, VALIDATION_STATUS string"
+        )
+        return frame.where(F.col("RUN_ID") == selected_run) if selected_run else frame
+
+    monkeypatch.setattr(M.L, "qa_validation_results", validation_results)
     monkeypatch.setattr(M.E, "list_incoming_files", Mock(side_effect=AssertionError("QA must not read incoming")))
-    result = M.run_qa_validation(2025, 7, id_interno="1e0", spark=spark, dbutils=Mock())
+    result = M.run_qa_validation(2025, scope, id_interno="1e0", spark=spark, dbutils=Mock())
     assert len(result) == 17
-    assert result["qa_final_status"].first().STATUS == "PASS"
-    assert result["qa_product_catalog_coverage"].first().MATCHED_PRODUCT_ROWS == 1
-    joined = result["qa_joined_ecommerce_data"].collect()
-    assert len(joined) == 1
+    assert result["qa_final_status"].first().STATUS == ("FAIL" if missing_history else "PASS")
+    assert result["qa_product_catalog_coverage"].first().MATCHED_PRODUCT_ROWS == (2 if scope == "ALL" else 1)
+    joined = result["qa_joined_ecommerce_data"].orderBy("MES").collect()
+    assert len(joined) == (2 if scope == "ALL" else 1)
     assert joined[0].PRODUCT_NOMBRE == "Product" and joined[0].STORE_CADENA == "Chain"
     assert joined[0].PRODUCT_MATCHED and joined[0].STORE_MATCHED
     assert joined[0].MONTO == 10.0
+    if scope == "ALL":
+        assert joined[1].PRODUCT_NOMBRE == "Changed product" and joined[1].STORE_CADENA == "Changed chain"
+        assert result["qa_catalog_duplicate_detail"].count() == 0
+        assert result["qa_snowflake_star_relationships"].first().STATUS == "PASS"
     M.E.list_incoming_files.assert_not_called()
 
 
 @pytest.mark.skipif(
     not __import__("os").environ.get("ECOMM_TEST_DELTA_JARS"), reason="Optional local Delta JARs not configured"
 )
-def test_complete_csv_batch_real_delta_and_file_movement(spark, catalogs, tmp_path, monkeypatch):
+@pytest.mark.parametrize("scope", [7, "ALL"])
+def test_complete_csv_batch_real_delta_and_file_movement(spark, catalogs, tmp_path, monkeypatch, scope):
     import csv
     import uuid
     from pathlib import Path
@@ -348,11 +379,21 @@ def test_complete_csv_batch_real_delta_and_file_movement(spark, catalogs, tmp_pa
         ]
     ]
     try:
-        record = M.run_pipeline(2025, 7, False, spark=spark, dbutils=dbutils)
+        record = M.run_pipeline(2025, scope, False, spark=spark, dbutils=dbutils)
         assert record["STATUS"] == "SUCCEEDED"
-        assert record["SOURCE_ROWS"] == 2 and record["STAGING_ROWS"] == 1 and record["TRANSFORMED_ROWS"] == 1
-        result = spark.table(C.FACT_CURATED_TABLE).collect()
-        assert len(result) == 1 and result[0].MES == 7 and result[0].MONTO == 20.0
+        expected_rows = 2 if scope == "ALL" else 1
+        assert (
+            record["SOURCE_ROWS"] == 2
+            and record["STAGING_ROWS"] == expected_rows
+            and record["TRANSFORMED_ROWS"] == expected_rows
+        )
+        result = spark.table(C.FACT_CURATED_TABLE).orderBy("MES").collect()
+        assert len(result) == expected_rows and result[0].MES == 7 and result[0].MONTO == 20.0
+        if scope == "ALL":
+            assert result[1].MES == 8 and result[1].MONTO == 10.0
+            assert str(record["PERIOD_START_DATE"]) == "2025-01-01"
+            assert str(record["PERIOD_END_DATE"]) == "2025-12-31"
+            assert spark.table(C.CATALOG_EDP_TABLE).first().MES is None
         assert result[0].PRODUCT_MARCA == "Brand" and result[0].STORE_CADENA == "Chain"
         assert spark.table(C.VALIDATION_RESULTS_TABLE).where(F.col("VALIDATION_STATUS") == "FAIL").count() == 0
         assert list(incoming.iterdir()) == [] and len(list(current.iterdir())) == 4

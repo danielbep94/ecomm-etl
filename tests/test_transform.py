@@ -169,3 +169,37 @@ def test_valid_explicit_types_preserve_exact_long_values(spark, catalogs):
     finally:
         for frame in caches:
             frame.unpersist()
+
+
+@pytest.mark.parametrize("month", ["ALL", "all", " ALL "])
+def test_annual_scope_parameters(month):
+    assert V.validate_parameters(2026, month) == (2026, "ALL", False)
+    assert str(V.period_bounds(2026, "ALL")[0]) == "2026-01-01"
+    assert str(V.period_bounds(2026, "ALL")[1]) == "2026-12-31"
+
+
+@pytest.mark.parametrize("month", [None, "", " ", 0, "YEAR"])
+def test_empty_or_implicit_annual_scope_rejected(month):
+    with pytest.raises(V.ValidationError, match="ALL"):
+        V.validate_parameters(2026, month)
+
+
+def test_annual_detection_and_metadata_preserve_all_twelve_months(spark):
+    source = spark.createDataFrame(
+        [(202600 + month, 1, 1, 1.0, 10.0, "EDP") for month in range(1, 13)],
+        "TIME_ID long, ID_STORE long, ID_INTERNO long, UNIDADES double, MONTO double, BU string",
+    )
+    report = V.ValidationReport(spark, "annual", 2026, "ALL")
+    annual, metrics = V.detect_fact_period(source, 2026, "ALL", report)
+    metadata = {
+        "RUN_ID": "annual",
+        "LOGICAL_DATASET": "ECOMMERCE_FACT",
+        "ORIGINAL_FILE_NAME": "fact.csv",
+        "SOURCE_PATH": "file:/fact.csv",
+        "FILE_FINGERPRINT": "a" * 64,
+        "FILE_YEAR": 2026,
+    }
+    annotated = V.add_operational_metadata(annual, metadata, 2026, "ALL")
+    assert sorted(row.MES for row in annotated.select("MES").collect()) == list(range(1, 13))
+    assert metrics["LOAD_SCOPE"] == "YEAR" and metrics["REQUESTED_PERIOD_ROWS"] == 12 and not report.failed
+    assert report.dataframe().first().MES is None

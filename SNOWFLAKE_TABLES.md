@@ -71,7 +71,7 @@ El ETL copia la historia completa de catálogos Delta a staging y usa MERGE por
 RUN_ID + ID para insertar snapshots nuevos y actualizar vigencias de existentes,
 sin borrar historia. Crea cuatro staging transitorios con sufijo RUN_ID, comprueba
 conteos y registros, y abre una única transacción nativa: tres MERGE, reemplazo
-DELETE/INSERT del ANIO/MES de la fact, conciliación exacta de las cuatro tablas y
+DELETE/INSERT del ANIO/MES de la fact, o de todo ANIO con MES=ALL,, conciliación exacta de las cuatro tablas y
 verificación de joins de toda la fact, incluidos meses anteriores. Confirma todo
 con COMMIT o intenta ROLLBACK ante un error. Todo DDL ocurre fuera de la transacción.
 Al finalizar intenta eliminar los cuatro staging; las fallas quedan en métricas.
@@ -161,3 +161,18 @@ de los controles existentes; no requiere volver a subir los CSV.
 productos/tiendas y banderas de coincidencia usando los joins anteriores.
 Los catálogos rechazan cualquier duplicado por snapshot, incluso registros
 idénticos; las claves de versiones históricas se validan antes del staging.
+
+## Carga de archivo anual
+
+Usa ANIO=2026 y MES=ALL en el notebook de carga y en QA. El SQL del reemplazo
+anual usa `WHERE ANIO=2026`; todo ese año se sustituye con los registros del
+archivo, incluso si este contiene menos de doce meses. Los meses ausentes del
+archivo se eliminan del año reemplazado. Otros años se conservan. Sigue siendo
+una sola transacción Snowflake para los tres catálogos y la fact completa.
+
+Las columnas y tipos de las cuatro tablas no cambian. La fact conserva el mes
+real derivado de TIME_ID; el campo MES del lote en catálogos/validaciones es NULL
+para una carga anual. El tracker registra los límites del año. Los controles de
+reproceso consultan periodos solapados para proteger tanto cargas mensuales como
+anuales ya exitosas. QA anual une catálogos por RUN_ID, incluso si cada mes se
+cargó en un intento diferente.

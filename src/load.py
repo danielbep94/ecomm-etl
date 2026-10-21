@@ -11,7 +11,7 @@ from pyspark.sql import types as T
 from conf import settings as C
 from conf.credentials import SNOWFLAKE_SOURCE_NAME
 from src.run_tracking import PipelineError, read_snowflake_metrics
-from src.transform import period_filter
+from src.transform import period_bounds, period_filter, period_predicate
 
 
 def verify_hive_objects(spark):
@@ -90,18 +90,23 @@ def load_catalog_snapshot(spark, table, frame):
 
 def load_monthly_delta(spark, table, frame, anio, mes):
     if (
-        frame.where(F.col("ANIO").isNull() | F.col("MES").isNull() | (F.col("ANIO") != anio) | (F.col("MES") != mes))
+        frame.where(
+            F.col("ANIO").isNull()
+            | F.col("MES").isNull()
+            | ~F.col("MES").between(1, 12)
+            | ~F.expr(period_predicate(anio, mes))
+        )
         .limit(1)
         .count()
     ):
         raise PipelineError("Delta input contains rows outside the requested period.", "DELTA_LOAD_ERROR")
     if not frame.limit(1).count():
-        raise PipelineError("Refusing an empty monthly replacement.", "DELTA_LOAD_ERROR")
+        raise PipelineError("Refusing an empty period replacement.", "DELTA_LOAD_ERROR")
     ensure_delta_table(spark, table, frame, ["ANIO", "MES"])
     (
         frame.write.format("delta")
         .mode("overwrite")
-        .option("replaceWhere", f"ANIO = {int(anio)} AND MES = {int(mes)}")
+        .option("replaceWhere", period_predicate(anio, mes, spaced=True))
         .saveAsTable(table)
     )
 
@@ -222,7 +227,7 @@ def read_snowflake_period_metrics(spark, options, anio, mes):
         spark,
         options,
         f"SELECT COUNT(*) AS ROW_COUNT, COALESCE(SUM(CAST(MONTO AS NUMBER(38,6))),0) AS AMOUNT "
-        f"FROM {C.TARGET_SNOWFLAKE_TABLE} WHERE ANIO={int(anio)} AND MES={int(mes)}",
+        f"FROM {C.TARGET_SNOWFLAKE_TABLE} WHERE {period_predicate(anio, mes)}",
     )
     return {"rows": int(result["ROW_COUNT"]), "amount": Decimal(str(result["AMOUNT"]))}
 
@@ -232,13 +237,10 @@ def snowflake_read(spark, options, query):
 
 
 def read_pipeline_history(spark, options, anio, mes, run_id=None):
-    import calendar
-    import datetime as dt
-
-    start, end = dt.date(anio, mes, 1), dt.date(anio, mes, calendar.monthrange(anio, mes)[1])
+    start, end = period_bounds(anio, mes)
     query = (
         f"SELECT * FROM {C.PIPELINE_RUN_HISTORY_TABLE} WHERE PIPELINE_NAME='{C.PIPELINE_NAME}' "
-        f"AND PERIOD_START_DATE='{start.isoformat()}' AND PERIOD_END_DATE='{end.isoformat()}'"
+        f"AND PERIOD_START_DATE<='{end.isoformat()}' AND PERIOD_END_DATE>='{start.isoformat()}'"
     )
     if run_id:
         import uuid
@@ -381,8 +383,8 @@ def load_snowflake_period(spark, options, frame, anio, mes, run_id, observed_met
         frame.where(
             F.col("ANIO").isNull()
             | F.col("MES").isNull()
-            | (F.col("ANIO") != anio)
-            | (F.col("MES") != mes)
+            | ~F.col("MES").between(1, 12)
+            | ~F.expr(period_predicate(anio, mes))
             | F.col("RUN_ID").isNull()
             | (F.col("RUN_ID") != run_id)
         )
@@ -399,7 +401,7 @@ def load_snowflake_period(spark, options, frame, anio, mes, run_id, observed_met
     targets = {**C.SNOWFLAKE_CATALOG_TABLES, "ECOMMERCE_FACT": C.TARGET_SNOWFLAKE_TABLE}
     suffix = uuid.UUID(run_id).hex.upper()
     stages = {dataset: sql_identifier(table + "_STAGE_" + suffix) for dataset, table in targets.items()}
-    predicate = f"ANIO={int(anio)} AND MES={int(mes)}"
+    predicate = period_predicate(anio, mes)
     counts = {dataset: catalog.count() for dataset, catalog in catalog_frames.items()}
     counts["ECOMMERCE_FACT"] = expected["rows"]
     catalog_metrics, cleanup, created = {}, {}, []
@@ -519,7 +521,7 @@ def reconcile_delta_to_snowflake(spark, options, delta, anio, mes, catalog_frame
     target = snowflake_read(
         spark,
         options,
-        f"SELECT {','.join(expected.columns)} FROM {C.TARGET_SNOWFLAKE_TABLE} WHERE ANIO={int(anio)} AND MES={int(mes)}",
+        f"SELECT {','.join(expected.columns)} FROM {C.TARGET_SNOWFLAKE_TABLE} WHERE {period_predicate(anio, mes)}",
     )
     left, right = frame_metrics(expected), frame_metrics(target)
     if not compare_metrics(left, right) or multiset_difference(expected, target):
@@ -577,7 +579,9 @@ def qa_snowflake_relationships(spark, fact, catalogs):
 
 
 def qa_validation_results(spark, anio, mes, run_id=None, logical_dataset=None):
-    frame = period_filter(spark.table(C.VALIDATION_RESULTS_TABLE), anio, mes)
+    frame = spark.table(C.VALIDATION_RESULTS_TABLE).where(F.col("ANIO") == anio)
+    if mes != "ALL":
+        frame = frame.where((F.col("MES") == mes) | F.col("MES").isNull())
     if run_id:
         frame = frame.where(F.col("RUN_ID") == run_id)
     if logical_dataset:
