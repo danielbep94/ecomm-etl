@@ -140,7 +140,7 @@ def reset_business_test_tables(spark, options, logger):
     for table, _, _ in delta:
         if spark.catalog.tableExists(table):
             _assert_delta(spark, table)
-    completed, target = [], None
+    completed, target, reset_started = [], "SNOWFLAKE_CONNECTION", False
     try:
         with snowflake_connection(options) as conn:
             cursor = conn.cursor()
@@ -148,6 +148,7 @@ def reset_business_test_tables(spark, options, logger):
                 for target, frame in snowflake.items():
                     logger.event("TEST_RESET", "RESETTING", TABLE_NAME=target, SYSTEM="SNOWFLAKE")
                     ddl = ",".join(f"{sql_identifier(f.name)} {_sql_type(f.dataType)}" for f in frame.schema)
+                    reset_started = True
                     cursor.execute(f"CREATE OR REPLACE TABLE {target} ({ddl}) COPY GRANTS")
                     ensure_snowflake_table(cursor, target, frame)
                     if _cursor_count(cursor, target):
@@ -178,9 +179,15 @@ def reset_business_test_tables(spark, options, logger):
             "FAILED",
             TABLE_NAME=target,
             COMPLETED_TABLES=len(completed),
-            ERROR_TYPE=type(exc).__name__,
+            ERROR_TYPE=getattr(exc, "error_type", type(exc).__name__),
             ERROR_MESSAGE=str(exc),
         )
+        if not reset_started:
+            detail = str(exc) if isinstance(exc, PipelineError) else "Check the reset log for the connection error."
+            raise PipelineError(
+                f"Test reset aborted before changing any table. {detail}",
+                getattr(exc, "error_type", "TEST_RESET_ERROR"),
+            ) from None
         raise PipelineError(
             f"Test reset stopped at {target} after {len(completed)} verified tables; completed resets are not rolled back. Stop writers and rerun reset.",
             "TEST_RESET_ERROR",
@@ -335,7 +342,13 @@ def _sql_type(kind):
 
 @contextlib.contextmanager
 def snowflake_connection(options):
-    import snowflake.connector
+    try:
+        import snowflake.connector
+    except ImportError:
+        raise PipelineError(
+            'Snowflake Python dependencies are missing or cannot be imported. In a Databricks cell run %pip install "snowflake-connector-python>=3.12,<5" "cryptography>=44,<51", then run dbutils.library.restartPython() in a separate cell and rerun the notebook.',
+            "RUNTIME_DEPENDENCY_ERROR",
+        ) from None
 
     conn = None
     try:

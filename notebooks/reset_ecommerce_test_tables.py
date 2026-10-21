@@ -9,6 +9,11 @@
 # MAGIC El reset no es atómico entre tablas o sistemas; si falla, revisa el último
 # MAGIC TABLE_NAME en los logs y vuelve a ejecutarlo hasta obtener nueve tablas vacías.
 # MAGIC Necesita los permisos de carga y OWNERSHIP/CREATE OR REPLACE en Snowflake.
+# MAGIC Antes del primer uso, instala las dependencias Python en este mismo cómputo:
+# MAGIC `%pip install "snowflake-connector-python>=3.12,<5" "cryptography>=44,<51"`.
+# MAGIC Después ejecuta `dbutils.library.restartPython()` en otra celda y vuelve a
+# MAGIC ejecutar el notebook desde el principio. Clonar el repo no instala paquetes;
+# MAGIC el conector Spark/JDBC tampoco instala el conector Python.
 
 # COMMAND ----------
 

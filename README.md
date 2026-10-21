@@ -266,6 +266,25 @@ schemas ni recursos adicionales.
    `snowflake-connector-python` y `cryptography`. No instales PySpark ni Delta
    desde PyPI en el cluster: ambos los proporciona Databricks Runtime. En jobs
    también puedes instalar el wheel de este proyecto como librería.
+
+   Si aparece `ModuleNotFoundError: No module named 'snowflake'`, instala las
+   dependencias en **el mismo cómputo y entorno Python** que ejecuta el notebook:
+
+   ```python
+   %pip install "snowflake-connector-python>=3.12,<5" "cryptography>=44,<51"
+   ```
+
+   En una **celda separada**, reinicia Python:
+
+   ```python
+   dbutils.library.restartPython()
+   ```
+
+   Vuelve a ejecutar el notebook desde el principio. Clonar la Git folder y tener
+   el JAR Spark/JDBC no instalan el paquete Python. En jobs nuevos configura estas
+   dependencias como librerías del job o instala el wheel del proyecto. Si el reset
+   falla al importar/conectar, antes de su primer DDL, ninguna tabla se ha cambiado;
+   desde 3.2.1 el error informa este caso y muestra el comando de instalación.
 4. El conector **Spark de Snowflake** `net.snowflake.spark.snowflake` debe estar
    disponible en el Runtime. El conector Python no reemplaza ese JAR. Si tu
    Runtime no lo incluye, instala las versiones oficiales del conector Spark y

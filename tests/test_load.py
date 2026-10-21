@@ -553,3 +553,65 @@ def test_reset_refuses_shared_history_targets_before_any_mutation(spark, monkeyp
     with pytest.raises(PipelineError, match="excluding shared history"):
         L.reset_business_test_tables(spark, {}, Mock())
     connection.assert_not_called()
+
+
+def test_missing_snowflake_package_has_actionable_error_before_connection(monkeypatch):
+    import builtins
+
+    original_import = builtins.__import__
+
+    def missing_connector(name, *args, **kwargs):
+        if name == "snowflake.connector":
+            raise ModuleNotFoundError("No module named 'snowflake'", name="snowflake")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", missing_connector)
+    with pytest.raises(PipelineError, match="%pip install") as captured:
+        with L.snowflake_connection({}):
+            pytest.fail("A missing package must not open a connection")
+    assert captured.value.error_type == "RUNTIME_DEPENDENCY_ERROR"
+    assert "restartPython()" in str(captured.value)
+
+
+@pytest.mark.parametrize("failure", ["dependency", "connection", "first_ddl"])
+def test_reset_distinguishes_preflight_failure_from_unverified_first_ddl(monkeypatch, failure):
+    spark, logger, frame = Mock(), Mock(), Mock(schema=[])
+    spark.catalog.tableExists.return_value = False
+    delta = [
+        (t, frame, None)
+        for t in [
+            C.CATALOG_EDP_TABLE,
+            C.CATALOG_WATERS_TABLE,
+            C.CATALOG_STORE_TABLE,
+            C.FACT_STAGING_TABLE,
+            C.FACT_CURATED_TABLE,
+        ]
+    ]
+    snowflake = dict.fromkeys(list(C.SNOWFLAKE_CATALOG_TABLES.values()) + [C.TARGET_SNOWFLAKE_TABLE], frame)
+    monkeypatch.setattr(L, "verify_hive_objects", Mock())
+    monkeypatch.setattr(L, "_empty_business_tables", lambda _: (delta, snowflake))
+    code = "RUNTIME_DEPENDENCY_ERROR" if failure == "dependency" else "SNOWFLAKE_CONNECTION_ERROR"
+    cursor = Mock()
+    cursor.execute.side_effect = RuntimeError("DDL failed")
+    conn = Mock()
+    conn.cursor.return_value = cursor
+
+    @contextlib.contextmanager
+    def connection(options):
+        if failure != "first_ddl":
+            raise PipelineError("Install dependencies or check the connection.", code)
+        yield conn
+
+    monkeypatch.setattr(L, "snowflake_connection", connection)
+    with pytest.raises(PipelineError) as captured:
+        L.reset_business_test_tables(spark, {}, logger)
+    if failure == "first_ddl":
+        assert "after 0 verified tables" in str(captured.value)
+        assert "before changing any table" not in str(captured.value)
+        cursor.execute.assert_called_once()
+    else:
+        assert "before changing any table" in str(captured.value)
+        assert captured.value.error_type == code
+        cursor.execute.assert_not_called()
+        assert logger.event.call_args.kwargs["ERROR_TYPE"] == code
+    frame.write.format.assert_not_called()
